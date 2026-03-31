@@ -88,14 +88,16 @@ model ImageTranslation {
   id                 String   @id @default(uuid())
   shop               String
   resourceId         String
+  imageId            String   @default("featured")
+  imagePosition      Int      @default(0)
   locale             String
-  marketId           String?
+  marketId           String   @default("")
   originalImageUrl   String
   translatedImageUrl String
   metafieldId        String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  @@unique([shop, resourceId, locale, marketId])
+  @@unique([shop, resourceId, imageId, locale, marketId])
   @@index([shop, resourceId])
 }

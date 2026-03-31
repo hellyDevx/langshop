@@ -24,5 +24,10 @@ api_version = "2026-04"
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_products,write_products,read_translations,write_translations,write_locales,read_content,read_themes,read_markets,write_files,read_files"
 
+[app_proxy]
+url = "https://example.com"
+subpath = "langshop"
+prefix = "apps"
+
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]

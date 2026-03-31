@@ -1,0 +1,11 @@
+api_version = "2026-04"
+
+[[extensions]]
+uid = "970a40a7-32c0-6901-4038-129c17d0a22633c65996"
+type = "theme"
+name = "LangShop Image Swap"
+handle = "langshop-image-swap"
+
+  [extensions.capabilities]
+  block = true
+  app_embed = true

@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { useLoaderData, useActionData, useSubmit, useNavigation } from "@remix-run/react";
+import {
+  useLoaderData,
+  useActionData,
+  useSubmit,
+  useNavigation,
+  useSearchParams,
+} from "@remix-run/react";
 import {
   Page,
   Card,
@@ -13,46 +19,49 @@ import {
   Button,
   Modal,
   TextField,
+  Select,
   DropZone,
+  Box,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
-import { fetchShopLocales } from "../services/markets.server";
-import { getImageTranslations } from "../services/image-translation.server";
-import { getLocaleDisplayName } from "../utils/locale-utils";
-import prisma from "../db.server";
+import { fetchShopLocales, fetchMarkets } from "../services/markets.server";
+import {
+  getImageTranslations,
+  saveImageTranslation,
+  removeImageTranslation,
+  syncGalleryMetafield,
+} from "../services/image-translation.server";
+import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
 
 const PRODUCT_QUERY = `#graphql
   query Product($id: ID!) {
     product(id: $id) {
       id
       title
-      featuredImage {
-        url
-        altText
+      images(first: 50) {
+        nodes {
+          id
+          url
+          altText
+        }
       }
     }
   }
 `;
 
 const FILES_QUERY = `#graphql
-  query Files($first: Int!, $after: String, $query: String) {
-    files(first: $first, after: $after, query: $query, sortKey: CREATED_AT, reverse: true) {
+  query Files($first: Int!) {
+    files(first: $first, sortKey: CREATED_AT, reverse: true, query: "media_type:IMAGE") {
       nodes {
         id
         alt
         ... on MediaImage {
           image {
             url
-            width
-            height
           }
         }
-      }
-      pageInfo {
-        hasNextPage
-        endCursor
       }
     }
   }
@@ -64,15 +73,9 @@ const STAGED_UPLOADS_CREATE = `#graphql
       stagedTargets {
         url
         resourceUrl
-        parameters {
-          name
-          value
-        }
+        parameters { name value }
       }
-      userErrors {
-        field
-        message
-      }
+      userErrors { field message }
     }
   }
 `;
@@ -82,34 +85,9 @@ const FILE_CREATE = `#graphql
     fileCreate(files: $files) {
       files {
         id
-        alt
-        ... on MediaImage {
-          image {
-            url
-          }
-        }
+        ... on MediaImage { image { url } }
       }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-
-const METAFIELDS_SET = `#graphql
-  mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      metafields {
-        id
-        namespace
-        key
-        value
-      }
-      userErrors {
-        field
-        message
-      }
+      userErrors { field message }
     }
   }
 `;
@@ -117,11 +95,19 @@ const METAFIELDS_SET = `#graphql
 export const loader = async ({ request, params }) => {
   const { admin, session } = await authenticate.admin(request);
   const resourceId = `gid://shopify/Product/${params.resourceId}`;
+  const url = new URL(request.url);
+  const selectedLocale = url.searchParams.get("locale") || null;
+  const selectedMarketId = url.searchParams.get("marketId") || "";
 
-  const [locales, imageTranslations] = await Promise.all([
+  const [locales, markets] = await Promise.all([
     fetchShopLocales(admin),
-    getImageTranslations(session.shop, resourceId),
+    fetchMarkets(admin),
   ]);
+
+  const locale =
+    selectedLocale ||
+    locales.find((l) => !l.primary && l.published)?.locale ||
+    null;
 
   let product = null;
   try {
@@ -134,11 +120,18 @@ export const loader = async ({ request, params }) => {
     console.error("Failed to fetch product:", error.message);
   }
 
-  // Fetch image files from Content > Files
+  // Fetch existing translations for this product + market
+  const imageTranslations = await getImageTranslations(
+    session.shop,
+    resourceId,
+    selectedMarketId,
+  );
+
+  // Fetch store files for the picker
   let files = [];
   try {
     const filesResponse = await admin.graphql(FILES_QUERY, {
-      variables: { first: 50, query: "media_type:IMAGE" },
+      variables: { first: 50 },
     });
     const filesData = await filesResponse.json();
     files = (filesData.data?.files?.nodes || []).filter((f) => f.image?.url);
@@ -148,101 +141,58 @@ export const loader = async ({ request, params }) => {
 
   return {
     product,
-    locales: locales.filter((l) => !l.primary),
+    locales,
+    markets,
     imageTranslations,
-    resourceId,
     files,
+    resourceId,
+    selectedLocale: locale,
+    selectedMarketId,
   };
 };
-
-async function setMetafieldAndTrack(admin, session, resourceId, locale, fileId, fileUrl, originalImageUrl) {
-  const metafieldResponse = await admin.graphql(METAFIELDS_SET, {
-    variables: {
-      metafields: [
-        {
-          ownerId: resourceId,
-          namespace: "langshop_images",
-          key: `translated_image_${locale}`,
-          type: "file_reference",
-          value: fileId,
-        },
-      ],
-    },
-  });
-
-  const metafieldData = await metafieldResponse.json();
-  if (metafieldData.data.metafieldsSet.userErrors.length > 0) {
-    throw new Error(
-      metafieldData.data.metafieldsSet.userErrors.map((e) => e.message).join(", "),
-    );
-  }
-
-  const metafield = metafieldData.data.metafieldsSet.metafields[0];
-
-  await prisma.imageTranslation.upsert({
-    where: {
-      shop_resourceId_locale_marketId: {
-        shop: session.shop,
-        resourceId,
-        locale,
-        marketId: "",
-      },
-    },
-    create: {
-      shop: session.shop,
-      resourceId,
-      locale,
-      marketId: "",
-      originalImageUrl: originalImageUrl || "",
-      translatedImageUrl: fileUrl,
-      metafieldId: metafield.id,
-    },
-    update: {
-      translatedImageUrl: fileUrl,
-      metafieldId: metafield.id,
-    },
-  });
-
-  return metafield;
-}
 
 export const action = async ({ request, params }) => {
   const { admin, session } = await authenticate.admin(request);
   const resourceId = `gid://shopify/Product/${params.resourceId}`;
   const formData = await request.formData();
   const intent = formData.get("intent");
+  const locale = formData.get("locale");
+  const marketId = formData.get("marketId") || "";
+  const imageId = formData.get("imageId");
+  const imagePosition = parseInt(formData.get("imagePosition") || "0", 10);
+  const originalImageUrl = formData.get("originalImageUrl") || "";
 
-  // Select an existing file from Content > Files
   if (intent === "select-file") {
-    const locale = formData.get("locale");
-    const fileId = formData.get("fileId");
     const fileUrl = formData.get("fileUrl");
-    const originalImageUrl = formData.get("originalImageUrl");
-
-    if (!locale || !fileId || !fileUrl) {
+    if (!locale || !imageId || !fileUrl) {
       return json({ error: "Missing required fields" }, { status: 400 });
     }
 
     try {
-      await setMetafieldAndTrack(admin, session, resourceId, locale, fileId, fileUrl, originalImageUrl);
-      return json({ success: true, locale });
+      await saveImageTranslation(session.shop, {
+        resourceId,
+        imageId,
+        imagePosition,
+        locale,
+        marketId,
+        fileUrl,
+        originalImageUrl,
+      });
+      await syncGalleryMetafield(admin, session.shop, resourceId, locale, marketId);
+      return json({ success: true });
     } catch (error) {
       return json({ error: error.message }, { status: 500 });
     }
   }
 
-  // Upload a new image file
   if (intent === "upload") {
-    const locale = formData.get("locale");
     const imageFile = formData.get("image");
-    const originalImageUrl = formData.get("originalImageUrl");
-
-    if (!locale || !imageFile) {
+    if (!locale || !imageId || !imageFile) {
       return json({ error: "Missing required fields" }, { status: 400 });
     }
 
     try {
-      // Step 1: Create staged upload
+      // Staged upload
       const stagedResponse = await admin.graphql(STAGED_UPLOADS_CREATE, {
         variables: {
           input: [
@@ -255,18 +205,10 @@ export const action = async ({ request, params }) => {
           ],
         },
       });
-
       const stagedData = await stagedResponse.json();
-      if (stagedData.data.stagedUploadsCreate.userErrors.length > 0) {
-        return json(
-          { error: stagedData.data.stagedUploadsCreate.userErrors.map((e) => e.message).join(", ") },
-          { status: 400 },
-        );
-      }
-
       const target = stagedData.data.stagedUploadsCreate.stagedTargets[0];
 
-      // Step 2: Upload to staged target
+      // Upload
       const uploadForm = new FormData();
       for (const param of target.parameters) {
         uploadForm.append(param.name, param.value);
@@ -274,40 +216,46 @@ export const action = async ({ request, params }) => {
       uploadForm.append("file", imageFile);
       await fetch(target.url, { method: "POST", body: uploadForm });
 
-      // Step 3: Create file in Shopify
+      // Create file
       const fileResponse = await admin.graphql(FILE_CREATE, {
         variables: {
           files: [{ originalSource: target.resourceUrl, contentType: "IMAGE" }],
         },
       });
-
       const fileData = await fileResponse.json();
-      if (fileData.data.fileCreate.userErrors.length > 0) {
-        return json(
-          { error: fileData.data.fileCreate.userErrors.map((e) => e.message).join(", ") },
-          { status: 400 },
-        );
-      }
-
       const file = fileData.data.fileCreate.files[0];
       const fileUrl = file.image?.url || target.resourceUrl;
 
-      // Step 4: Set metafield and track
-      await setMetafieldAndTrack(admin, session, resourceId, locale, file.id, fileUrl, originalImageUrl);
-      return json({ success: true, locale });
+      await saveImageTranslation(session.shop, {
+        resourceId,
+        imageId,
+        imagePosition,
+        locale,
+        marketId,
+        fileUrl,
+        originalImageUrl,
+      });
+      await syncGalleryMetafield(admin, session.shop, resourceId, locale, marketId);
+      return json({ success: true });
     } catch (error) {
       return json({ error: error.message }, { status: 500 });
     }
   }
 
-  // Remove image translation
   if (intent === "remove") {
-    const locale = formData.get("locale");
+    if (!locale || !imageId) {
+      return json({ error: "Missing required fields" }, { status: 400 });
+    }
+
     try {
-      await prisma.imageTranslation.deleteMany({
-        where: { shop: session.shop, resourceId, locale },
+      await removeImageTranslation(session.shop, {
+        resourceId,
+        imageId,
+        locale,
+        marketId,
       });
-      return json({ success: true, removed: locale });
+      await syncGalleryMetafield(admin, session.shop, resourceId, locale, marketId);
+      return json({ success: true, removed: true });
     } catch (error) {
       return json({ error: error.message }, { status: 500 });
     }
@@ -317,45 +265,101 @@ export const action = async ({ request, params }) => {
 };
 
 export default function ImageTranslationEditor() {
-  const { product, locales, imageTranslations, files } = useLoaderData();
+  const {
+    product,
+    locales,
+    markets,
+    imageTranslations,
+    files,
+    resourceId,
+    selectedLocale,
+    selectedMarketId,
+  } = useLoaderData();
+
   const actionData = useActionData();
   const submit = useSubmit();
   const navigation = useNavigation();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const isSubmitting = navigation.state === "submitting";
-  const [activeLocale, setActiveLocale] = useState(null);
+  const [pickerImageId, setPickerImageId] = useState(null);
+  const [pickerImagePosition, setPickerImagePosition] = useState(0);
+  const [pickerOriginalUrl, setPickerOriginalUrl] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
 
-  const translationsByLocale = {};
-  imageTranslations.forEach((t) => {
-    translationsByLocale[t.locale] = t;
-  });
+  const localeOptions = formatLocaleOptions(locales);
+  const marketOptions = [
+    { label: "All Markets (Global)", value: "" },
+    ...markets
+      .filter((m) => m.enabled)
+      .map((m) => ({ label: m.name, value: m.id })),
+  ];
 
-  const handleSelectFile = (file, locale) => {
-    const formData = new FormData();
-    formData.set("intent", "select-file");
-    formData.set("locale", locale);
-    formData.set("fileId", file.id);
-    formData.set("fileUrl", file.image.url);
-    formData.set("originalImageUrl", product?.featuredImage?.url || "");
-    submit(formData, { method: "POST" });
-    setActiveLocale(null);
+  // Build translation lookup: imageId -> translation record
+  const translationMap = {};
+  imageTranslations
+    .filter((t) => t.locale === selectedLocale)
+    .forEach((t) => {
+      translationMap[t.imageId] = t;
+    });
+
+  const productImages = product?.images?.nodes || [];
+
+  const handleLocaleChange = (value) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("locale", value);
+    setSearchParams(params);
   };
 
-  const handleFileUpload = (droppedFiles, locale) => {
+  const handleMarketChange = (value) => {
+    const params = new URLSearchParams(searchParams);
+    if (value) {
+      params.set("marketId", value);
+    } else {
+      params.delete("marketId");
+    }
+    setSearchParams(params);
+  };
+
+  const openPicker = (imageId, position, originalUrl) => {
+    setPickerImageId(imageId);
+    setPickerImagePosition(position);
+    setPickerOriginalUrl(originalUrl);
+    setSearchQuery("");
+  };
+
+  const handleSelectFile = (file) => {
+    const formData = new FormData();
+    formData.set("intent", "select-file");
+    formData.set("locale", selectedLocale);
+    formData.set("marketId", selectedMarketId);
+    formData.set("imageId", pickerImageId);
+    formData.set("imagePosition", pickerImagePosition.toString());
+    formData.set("originalImageUrl", pickerOriginalUrl);
+    formData.set("fileUrl", file.image.url);
+    submit(formData, { method: "POST" });
+    setPickerImageId(null);
+  };
+
+  const handleUpload = (droppedFiles, imageId, position, originalUrl) => {
     if (droppedFiles.length === 0) return;
     const formData = new FormData();
     formData.set("intent", "upload");
-    formData.set("locale", locale);
+    formData.set("locale", selectedLocale);
+    formData.set("marketId", selectedMarketId);
+    formData.set("imageId", imageId);
+    formData.set("imagePosition", position.toString());
+    formData.set("originalImageUrl", originalUrl);
     formData.set("image", droppedFiles[0]);
-    formData.set("originalImageUrl", product?.featuredImage?.url || "");
     submit(formData, { method: "POST", encType: "multipart/form-data" });
   };
 
-  const handleRemove = (locale) => {
+  const handleRemove = (imageId) => {
     const formData = new FormData();
     formData.set("intent", "remove");
-    formData.set("locale", locale);
+    formData.set("locale", selectedLocale);
+    formData.set("marketId", selectedMarketId);
+    formData.set("imageId", imageId);
     submit(formData, { method: "POST" });
   };
 
@@ -363,6 +367,10 @@ export default function ImageTranslationEditor() {
     searchQuery
       ? (f.alt || "").toLowerCase().includes(searchQuery.toLowerCase())
       : true,
+  );
+
+  const primaryLocaleName = getLocaleDisplayName(
+    locales.find((l) => l.primary)?.locale || "en",
   );
 
   return (
@@ -374,120 +382,187 @@ export default function ImageTranslationEditor() {
       <BlockStack gap="500">
         {actionData?.success && (
           <Banner tone="success">
-            {actionData.removed
-              ? "Image removed."
-              : `Image set for ${getLocaleDisplayName(actionData.locale)}!`}
+            {actionData.removed ? "Image removed." : "Image saved!"}
           </Banner>
         )}
         {actionData?.error && (
           <Banner tone="critical">Error: {actionData.error}</Banner>
         )}
 
+        {/* Selectors */}
         <Card>
-          <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              Original Image
-            </Text>
-            {product?.featuredImage ? (
-              <Thumbnail
-                source={product.featuredImage.url}
-                alt={product.featuredImage.altText || product?.title}
-                size="large"
+          <InlineStack gap="400">
+            <div style={{ width: "250px" }}>
+              <Select
+                label="Market"
+                options={marketOptions}
+                value={selectedMarketId}
+                onChange={handleMarketChange}
               />
-            ) : (
-              <Text as="p" tone="subdued">
-                No featured image
-              </Text>
-            )}
-          </BlockStack>
+            </div>
+            <div style={{ width: "250px" }}>
+              <Select
+                label="Language"
+                options={localeOptions.length > 0 ? localeOptions : [{ label: "No languages", value: "" }]}
+                value={selectedLocale || ""}
+                onChange={handleLocaleChange}
+              />
+            </div>
+          </InlineStack>
         </Card>
 
-        <Text as="h2" variant="headingLg">
-          Per-Language Images
-        </Text>
-
-        <InlineGrid columns={{ xs: 1, sm: 2, md: 3 }} gap="400">
-          {locales.map((locale) => {
-            const existing = translationsByLocale[locale.locale];
-
-            return (
-              <Card key={locale.locale}>
-                <BlockStack gap="300">
-                  <InlineStack align="space-between">
-                    <Text as="h3" variant="headingMd">
-                      {getLocaleDisplayName(locale.locale)}
-                    </Text>
-                    {existing && <Badge tone="success">Set</Badge>}
-                  </InlineStack>
-
-                  {existing ? (
-                    <BlockStack gap="200">
-                      <Thumbnail
-                        source={existing.translatedImageUrl}
-                        alt={`${locale.locale} image`}
-                        size="large"
-                      />
-                      <InlineStack gap="200">
-                        <Button
-                          size="slim"
-                          onClick={() => setActiveLocale(locale.locale)}
-                        >
-                          Replace
-                        </Button>
-                        <Button
-                          size="slim"
-                          tone="critical"
-                          onClick={() => handleRemove(locale.locale)}
-                          loading={isSubmitting}
-                        >
-                          Remove
-                        </Button>
-                      </InlineStack>
-                    </BlockStack>
-                  ) : (
-                    <BlockStack gap="300">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        No image set for this language
-                      </Text>
-                      <Button
-                        onClick={() => setActiveLocale(locale.locale)}
-                        disabled={isSubmitting}
-                      >
-                        Select from Files
-                      </Button>
-                      <DropZone
-                        accept="image/*"
-                        type="image"
-                        onDrop={(files) => handleFileUpload(files, locale.locale)}
-                        allowMultiple={false}
-                        disabled={isSubmitting}
-                      >
-                        <DropZone.FileUpload actionHint="or drop to upload" />
-                      </DropZone>
-                    </BlockStack>
-                  )}
-                </BlockStack>
-              </Card>
-            );
-          })}
-        </InlineGrid>
-
-        {locales.length === 0 && (
+        {!selectedLocale ? (
+          <Banner>Please select a target language.</Banner>
+        ) : productImages.length === 0 ? (
           <Card>
             <Text as="p" tone="subdued">
-              No secondary languages configured. Add languages in Shopify Admin.
+              This product has no images.
             </Text>
+          </Card>
+        ) : (
+          <Card>
+            <BlockStack gap="0">
+              {/* Header */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "50px 1fr 1fr",
+                  gap: "16px",
+                  padding: "12px 16px",
+                  borderBottom: "1px solid var(--p-color-border)",
+                  background: "var(--p-color-bg-surface-secondary)",
+                }}
+              >
+                <Text as="span" variant="headingSm">
+                  #
+                </Text>
+                <Text as="span" variant="headingSm">
+                  Original ({primaryLocaleName})
+                </Text>
+                <Text as="span" variant="headingSm">
+                  {getLocaleDisplayName(selectedLocale)} Translation
+                </Text>
+              </div>
+
+              {/* Image rows */}
+              {productImages.map((image, index) => {
+                const translation = translationMap[image.id];
+
+                return (
+                  <div
+                    key={image.id}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "50px 1fr 1fr",
+                      gap: "16px",
+                      padding: "16px",
+                      borderBottom:
+                        index < productImages.length - 1
+                          ? "1px solid var(--p-color-border)"
+                          : "none",
+                      alignItems: "center",
+                    }}
+                  >
+                    {/* Position */}
+                    <Text as="span" variant="bodyMd" tone="subdued">
+                      {index + 1}
+                    </Text>
+
+                    {/* Original image */}
+                    <div>
+                      <img
+                        src={image.url}
+                        alt={image.altText || `Image ${index + 1}`}
+                        style={{
+                          width: "120px",
+                          height: "120px",
+                          objectFit: "cover",
+                          borderRadius: "8px",
+                          border: "1px solid var(--p-color-border)",
+                        }}
+                      />
+                    </div>
+
+                    {/* Translated image or actions */}
+                    <div>
+                      {translation ? (
+                        <InlineStack gap="300" align="start" blockAlign="center">
+                          <img
+                            src={translation.translatedImageUrl}
+                            alt={`${selectedLocale} image ${index + 1}`}
+                            style={{
+                              width: "120px",
+                              height: "120px",
+                              objectFit: "cover",
+                              borderRadius: "8px",
+                              border: "2px solid var(--p-color-border-success)",
+                            }}
+                          />
+                          <BlockStack gap="200">
+                            <Button
+                              size="slim"
+                              onClick={() =>
+                                openPicker(image.id, index, image.url)
+                              }
+                            >
+                              Replace
+                            </Button>
+                            <Button
+                              size="slim"
+                              tone="critical"
+                              onClick={() => handleRemove(image.id)}
+                              loading={isSubmitting}
+                            >
+                              Remove
+                            </Button>
+                          </BlockStack>
+                        </InlineStack>
+                      ) : (
+                        <InlineStack gap="200" align="start" blockAlign="center">
+                          <Button
+                            onClick={() =>
+                              openPicker(image.id, index, image.url)
+                            }
+                            disabled={isSubmitting}
+                          >
+                            Select from Files
+                          </Button>
+                          <div style={{ width: "150px" }}>
+                            <DropZone
+                              accept="image/*"
+                              type="image"
+                              onDrop={(files) =>
+                                handleUpload(files, image.id, index, image.url)
+                              }
+                              allowMultiple={false}
+                              disabled={isSubmitting}
+                            >
+                              <DropZone.FileUpload actionHint="Upload" />
+                            </DropZone>
+                          </div>
+                        </InlineStack>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </BlockStack>
           </Card>
         )}
 
-        {activeLocale && (
+        {selectedMarketId && (
+          <Banner tone="info">
+            Market-specific translations override global ones for customers in
+            this market.
+          </Banner>
+        )}
+
+        {/* File picker modal */}
+        {pickerImageId && (
           <Modal
             open={true}
-            onClose={() => {
-              setActiveLocale(null);
-              setSearchQuery("");
-            }}
-            title={`Select image for ${getLocaleDisplayName(activeLocale)}`}
+            onClose={() => setPickerImageId(null)}
+            title={`Select ${getLocaleDisplayName(selectedLocale)} image`}
             large
           >
             <Modal.Section>
@@ -504,14 +579,14 @@ export default function ImageTranslationEditor() {
 
                 {filteredFiles.length === 0 ? (
                   <Text as="p" tone="subdued">
-                    No image files found. Upload images in Content &gt; Files first.
+                    No image files found. Upload images in Content &gt; Files.
                   </Text>
                 ) : (
                   <InlineGrid columns={{ xs: 2, sm: 3, md: 4 }} gap="300">
                     {filteredFiles.map((file) => (
                       <div
                         key={file.id}
-                        onClick={() => handleSelectFile(file, activeLocale)}
+                        onClick={() => handleSelectFile(file)}
                         style={{
                           cursor: "pointer",
                           border: "2px solid transparent",
@@ -527,31 +602,20 @@ export default function ImageTranslationEditor() {
                           (e.currentTarget.style.borderColor = "transparent")
                         }
                       >
-                        <BlockStack gap="100" inlineAlign="center">
-                          <img
-                            src={file.image.url}
-                            alt={file.alt || ""}
-                            style={{
-                              width: "100%",
-                              height: "120px",
-                              objectFit: "cover",
-                              borderRadius: "6px",
-                            }}
-                          />
-                          {file.alt && (
-                            <Text as="p" variant="bodySm" truncate>
-                              {file.alt}
-                            </Text>
-                          )}
-                        </BlockStack>
+                        <img
+                          src={file.image.url}
+                          alt={file.alt || ""}
+                          style={{
+                            width: "100%",
+                            height: "120px",
+                            objectFit: "cover",
+                            borderRadius: "6px",
+                          }}
+                        />
                       </div>
                     ))}
                   </InlineGrid>
                 )}
-
-                <Text as="p" variant="bodySm" tone="subdued">
-                  Or upload a new image using the drop zone on the main page.
-                </Text>
               </BlockStack>
             </Modal.Section>
           </Modal>

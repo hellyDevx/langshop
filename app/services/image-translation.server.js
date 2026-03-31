@@ -1,45 +1,6 @@
 import prisma from "../db.server";
 
-const STAGED_UPLOADS_CREATE = `#graphql
-  mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
-    stagedUploadsCreate(input: $input) {
-      stagedTargets {
-        url
-        resourceUrl
-        parameters {
-          name
-          value
-        }
-      }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-
-const FILE_CREATE = `#graphql
-  mutation FileCreate($files: [FileCreateInput!]!) {
-    fileCreate(files: $files) {
-      files {
-        id
-        alt
-        ... on MediaImage {
-          image {
-            url
-          }
-        }
-      }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-
-const METAFIELD_SET = `#graphql
+const METAFIELDS_SET = `#graphql
   mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
     metafieldsSet(metafields: $metafields) {
       metafields {
@@ -56,83 +17,37 @@ const METAFIELD_SET = `#graphql
   }
 `;
 
-export async function getImageTranslations(shop, resourceId) {
+const METAFIELD_DEFINITION_CREATE = `#graphql
+  mutation MetafieldDefinitionCreate($definition: MetafieldDefinitionInput!) {
+    metafieldDefinitionCreate(definition: $definition) {
+      createdDefinition {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+export async function getImageTranslations(shop, resourceId, marketId = "") {
   return prisma.imageTranslation.findMany({
-    where: { shop, resourceId },
-    orderBy: { locale: "asc" },
+    where: { shop, resourceId, marketId },
+    orderBy: [{ imagePosition: "asc" }, { locale: "asc" }],
   });
 }
 
-export async function uploadAndSetImage(
-  admin,
+export async function saveImageTranslation(
   shop,
-  { resourceId, locale, marketId, imageFile, originalImageUrl },
+  { resourceId, imageId, imagePosition, locale, marketId, fileUrl, originalImageUrl },
 ) {
-  // Step 1: Create staged upload target
-  const stagedResponse = await admin.graphql(STAGED_UPLOADS_CREATE, {
-    variables: {
-      input: [
-        {
-          resource: "IMAGE",
-          filename: `translated_${locale}_${Date.now()}.png`,
-          mimeType: imageFile.type || "image/png",
-          httpMethod: "POST",
-        },
-      ],
-    },
-  });
-
-  const stagedData = await stagedResponse.json();
-  const target = stagedData.data.stagedUploadsCreate.stagedTargets[0];
-
-  // Step 2: Upload file to staged target
-  const formData = new FormData();
-  for (const param of target.parameters) {
-    formData.append(param.name, param.value);
-  }
-  formData.append("file", imageFile);
-  await fetch(target.url, { method: "POST", body: formData });
-
-  // Step 3: Create file in Shopify
-  const fileResponse = await admin.graphql(FILE_CREATE, {
-    variables: {
-      files: [
-        {
-          originalSource: target.resourceUrl,
-          contentType: "IMAGE",
-        },
-      ],
-    },
-  });
-
-  const fileData = await fileResponse.json();
-  const file = fileData.data.fileCreate.files[0];
-
-  // Step 4: Set metafield on the resource with the file reference
-  const ownerType = getOwnerType(resourceId);
-  const metafieldResponse = await admin.graphql(METAFIELD_SET, {
-    variables: {
-      metafields: [
-        {
-          ownerId: resourceId,
-          namespace: "langshop_images",
-          key: `translated_image_${locale}`,
-          type: "file_reference",
-          value: file.id,
-        },
-      ],
-    },
-  });
-
-  const metafieldData = await metafieldResponse.json();
-  const metafield = metafieldData.data.metafieldsSet.metafields[0];
-
-  // Step 5: Track in our database
-  await prisma.imageTranslation.upsert({
+  return prisma.imageTranslation.upsert({
     where: {
-      shop_resourceId_locale_marketId: {
+      shop_resourceId_imageId_locale_marketId: {
         shop,
         resourceId,
+        imageId,
         locale,
         marketId: marketId || "",
       },
@@ -140,26 +55,118 @@ export async function uploadAndSetImage(
     create: {
       shop,
       resourceId,
+      imageId,
+      imagePosition,
       locale,
       marketId: marketId || "",
       originalImageUrl,
-      translatedImageUrl: file.image?.url || target.resourceUrl,
-      metafieldId: metafield.id,
+      translatedImageUrl: fileUrl,
     },
     update: {
-      translatedImageUrl: file.image?.url || target.resourceUrl,
-      metafieldId: metafield.id,
+      translatedImageUrl: fileUrl,
+      imagePosition,
+    },
+  });
+}
+
+export async function removeImageTranslation(shop, { resourceId, imageId, locale, marketId }) {
+  return prisma.imageTranslation.deleteMany({
+    where: {
+      shop,
+      resourceId,
+      imageId,
+      locale,
+      marketId: marketId || "",
+    },
+  });
+}
+
+export async function syncGalleryMetafield(admin, shop, resourceId, locale, marketId = "") {
+  const translations = await prisma.imageTranslation.findMany({
+    where: { shop, resourceId, locale, marketId },
+    orderBy: { imagePosition: "asc" },
+  });
+
+  const gallery = translations.map((t) => ({
+    position: t.imagePosition,
+    imageId: t.imageId,
+    originalUrl: t.originalImageUrl,
+    translatedUrl: t.translatedImageUrl,
+  }));
+
+  const marketSuffix = marketId ? `_${marketId.split("/").pop()}` : "";
+  const key = `translated_gallery_${locale}${marketSuffix}`;
+
+  // Ensure metafield definition exists for storefront access
+  await ensureMetafieldDefinition(admin, key);
+
+  const response = await admin.graphql(METAFIELDS_SET, {
+    variables: {
+      metafields: [
+        {
+          ownerId: resourceId,
+          namespace: "langshop_images",
+          key,
+          type: "json",
+          value: JSON.stringify(gallery),
+        },
+      ],
     },
   });
 
-  return { fileId: file.id, metafieldId: metafield.id };
+  const data = await response.json();
+  if (data.data.metafieldsSet.userErrors.length > 0) {
+    throw new Error(
+      data.data.metafieldsSet.userErrors.map((e) => e.message).join(", "),
+    );
+  }
+
+  const metafield = data.data.metafieldsSet.metafields[0];
+
+  // Update metafieldId on all translation records
+  await prisma.imageTranslation.updateMany({
+    where: { shop, resourceId, locale, marketId },
+    data: { metafieldId: metafield.id },
+  });
+
+  return metafield;
 }
 
-function getOwnerType(resourceId) {
-  if (resourceId.includes("Product/")) return "PRODUCT";
-  if (resourceId.includes("Collection/")) return "COLLECTION";
-  if (resourceId.includes("Article/")) return "ARTICLE";
-  return "PRODUCT";
+// Cache to avoid re-creating definitions within a session
+const definitionCache = new Set();
+
+async function ensureMetafieldDefinition(admin, key) {
+  if (definitionCache.has(key)) return;
+
+  try {
+    const response = await admin.graphql(METAFIELD_DEFINITION_CREATE, {
+      variables: {
+        definition: {
+          name: `LangShop Gallery: ${key}`,
+          namespace: "langshop_images",
+          key,
+          type: "json",
+          ownerType: "PRODUCT",
+          access: {
+            storefront: "PUBLIC_READ",
+          },
+        },
+      },
+    });
+
+    const data = await response.json();
+    // Ignore "already exists" errors
+    const errors = data.data.metafieldDefinitionCreate.userErrors.filter(
+      (e) => !e.message.includes("already exists") && !e.message.includes("taken"),
+    );
+    if (errors.length > 0) {
+      console.error("Metafield definition error:", errors);
+    }
+  } catch (error) {
+    console.error("Failed to create metafield definition:", error.message);
+  }
+
+  definitionCache.add(key);
 }
 
 export async function deleteImageTranslation(shop, id) {
