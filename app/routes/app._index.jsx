@@ -1,62 +1,70 @@
-import { useLoaderData, Link } from "@remix-run/react";
+import { useLoaderData, useSearchParams, Link } from "@remix-run/react";
 import {
   Page,
   Layout,
   Card,
   BlockStack,
+  InlineStack,
   InlineGrid,
   Text,
   Badge,
-  InlineStack,
+  Select,
+  Button,
+  DataTable,
   Banner,
+  Spinner,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { fetchShopLocales, fetchMarkets } from "../services/markets.server";
-import { RESOURCE_TYPES } from "../utils/resource-type-map";
-import { getLocaleDisplayName } from "../utils/locale-utils";
-import { TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/translatableResources";
+import { fetchAllCategoryStats } from "../services/translatable-resources.server";
+import { RESOURCE_CATEGORIES, getStatusBadge } from "../utils/resource-type-map";
+import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
 
 export const loader = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
+  const url = new URL(request.url);
 
   const [locales, markets] = await Promise.all([
     fetchShopLocales(admin),
     fetchMarkets(admin),
   ]);
 
-  // Fetch counts for key resource types (just first page to get a sense)
-  const resourceCounts = {};
-  const keyTypes = ["PRODUCT", "COLLECTION", "PAGE", "ARTICLE", "METAFIELD"];
+  const selectedLocale =
+    url.searchParams.get("locale") ||
+    locales.find((l) => !l.primary && l.published)?.locale ||
+    null;
 
-  await Promise.all(
-    keyTypes.map(async (type) => {
-      try {
-        const response = await admin.graphql(TRANSLATABLE_RESOURCES_QUERY, {
-          variables: { resourceType: type, first: 1 },
-        });
-        const { data } = await response.json();
-        resourceCounts[type] = {
-          hasResources: data.translatableResources.nodes.length > 0,
-        };
-      } catch {
-        resourceCounts[type] = { hasResources: false };
-      }
-    }),
-  );
+  let categoryStats = {};
+  if (selectedLocale) {
+    categoryStats = await fetchAllCategoryStats(
+      admin,
+      session.shop,
+      selectedLocale,
+    );
+  }
 
   return {
     locales,
     markets,
-    resourceCounts,
+    selectedLocale,
+    categoryStats,
   };
 };
 
 export default function Dashboard() {
-  const { locales, markets, resourceCounts } = useLoaderData();
+  const { locales, markets, selectedLocale, categoryStats } = useLoaderData();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const primaryLocale = locales.find((l) => l.primary);
   const secondaryLocales = locales.filter((l) => !l.primary && l.published);
+  const localeOptions = formatLocaleOptions(locales);
+
+  const handleLocaleChange = (value) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("locale", value);
+    setSearchParams(params);
+  };
 
   return (
     <Page>
@@ -65,119 +73,127 @@ export default function Dashboard() {
         {secondaryLocales.length === 0 && (
           <Banner tone="warning">
             <p>
-              No secondary languages are enabled on your store. Go to{" "}
-              <strong>Settings &gt; Languages</strong> in Shopify Admin to add
-              languages before translating.
+              No secondary languages enabled. Go to Settings &gt; Languages in
+              Shopify Admin to add languages.
             </p>
           </Banner>
         )}
 
+        {/* Language selector + summary */}
         <Layout>
           <Layout.Section>
             <Card>
-              <BlockStack gap="400">
+              <BlockStack gap="300">
                 <Text as="h2" variant="headingMd">
-                  Languages
+                  Translation Stats
                 </Text>
-                <BlockStack gap="300">
-                  <InlineStack gap="200" align="start">
-                    <Badge tone="success">Primary</Badge>
-                    <Text as="span" variant="bodyMd" fontWeight="semibold">
-                      {getLocaleDisplayName(primaryLocale?.locale)}{" "}
-                      ({primaryLocale?.locale})
-                    </Text>
-                  </InlineStack>
-
-                  {secondaryLocales.length > 0 && (
-                    <BlockStack gap="200">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        {secondaryLocales.length} translation{" "}
-                        {secondaryLocales.length === 1
-                          ? "language"
-                          : "languages"}{" "}
-                        enabled
-                      </Text>
-                      <InlineStack gap="200" wrap>
-                        {secondaryLocales.map((locale) => (
-                          <Badge key={locale.locale}>
-                            {getLocaleDisplayName(locale.locale)} (
-                            {locale.locale})
-                          </Badge>
-                        ))}
-                      </InlineStack>
-                    </BlockStack>
-                  )}
-                </BlockStack>
+                <div style={{ maxWidth: "300px" }}>
+                  <Select
+                    label="Language"
+                    options={
+                      localeOptions.length > 0
+                        ? localeOptions
+                        : [{ label: "No languages", value: "" }]
+                    }
+                    value={selectedLocale || ""}
+                    onChange={handleLocaleChange}
+                  />
+                </div>
               </BlockStack>
             </Card>
           </Layout.Section>
 
           <Layout.Section variant="oneThird">
             <Card>
-              <BlockStack gap="400">
+              <BlockStack gap="200">
                 <Text as="h2" variant="headingMd">
-                  Markets
+                  Languages
                 </Text>
-                <BlockStack gap="200">
-                  {markets.map((market) => (
-                    <InlineStack
-                      key={market.id}
-                      gap="200"
-                      align="start"
-                    >
-                      <Badge
-                        tone={market.primary ? "success" : "info"}
-                      >
-                        {market.primary ? "Primary" : "Active"}
+                <InlineStack gap="200" align="start">
+                  <Badge tone="success">Primary</Badge>
+                  <Text as="span" variant="bodyMd">
+                    {getLocaleDisplayName(primaryLocale?.locale)} (
+                    {primaryLocale?.locale})
+                  </Text>
+                </InlineStack>
+                {secondaryLocales.length > 0 && (
+                  <InlineStack gap="100" wrap>
+                    {secondaryLocales.map((l) => (
+                      <Badge key={l.locale}>
+                        {getLocaleDisplayName(l.locale)}
                       </Badge>
-                      <Text as="span" variant="bodyMd">
-                        {market.name}
-                      </Text>
-                    </InlineStack>
-                  ))}
-                  {markets.length === 0 && (
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      No markets configured
-                    </Text>
-                  )}
-                </BlockStack>
+                    ))}
+                  </InlineStack>
+                )}
               </BlockStack>
             </Card>
           </Layout.Section>
         </Layout>
 
-        <Text as="h2" variant="headingLg">
-          Resources
-        </Text>
+        {/* Categories with stats */}
+        {selectedLocale &&
+          RESOURCE_CATEGORIES.map((category) => (
+            <Card key={category.id}>
+              <BlockStack gap="400">
+                <Text as="h2" variant="headingMd">
+                  {category.label}
+                </Text>
+                <DataTable
+                  columnContentTypes={[
+                    "text",
+                    "numeric",
+                    "numeric",
+                    "text",
+                    "text",
+                  ]}
+                  headings={[
+                    "Resource type",
+                    "Items qty",
+                    "Translated",
+                    "Status",
+                    "Action",
+                  ]}
+                  rows={category.resourceTypes.map((rt) => {
+                    const stats = categoryStats[rt.type] || {
+                      totalSampled: 0,
+                      translatedCount: 0,
+                      hasResources: false,
+                    };
+                    const badge = getStatusBadge(stats);
 
-        <InlineGrid columns={{ xs: 1, sm: 2, md: 3 }} gap="400">
-          {Object.entries(RESOURCE_TYPES).map(([type, config]) => (
-            <Card key={type}>
-              <BlockStack gap="300">
-                <InlineStack align="space-between">
-                  <Text as="h3" variant="headingMd">
-                    {config.label}
-                  </Text>
-                  {resourceCounts[type]?.hasResources && (
-                    <Badge tone="success">Available</Badge>
-                  )}
-                </InlineStack>
-                <Link
-                  to={`/app/resources/${config.slug}`}
-                  style={{
-                    textDecoration: "none",
-                    color: "var(--p-color-text-emphasis)",
-                  }}
-                >
-                  <Text as="span" variant="bodyMd">
-                    Manage translations →
-                  </Text>
-                </Link>
+                    return [
+                      rt.label,
+                      stats.hasResources ? String(stats.totalSampled) : "0",
+                      stats.hasResources
+                        ? String(stats.translatedCount)
+                        : "0",
+                      badge.tone ? (
+                        <Badge tone={badge.tone}>{badge.label}</Badge>
+                      ) : (
+                        <Badge>{badge.label}</Badge>
+                      ),
+                      stats.hasResources ? (
+                        <Link
+                          to={`/app/resources/${rt.slug}?locale=${selectedLocale}`}
+                          style={{
+                            textDecoration: "none",
+                          }}
+                        >
+                          <Button size="slim">Update</Button>
+                        </Link>
+                      ) : (
+                        <Button size="slim" disabled>
+                          Update
+                        </Button>
+                      ),
+                    ];
+                  })}
+                />
               </BlockStack>
             </Card>
           ))}
-        </InlineGrid>
 
+        {/* Quick links */}
         <InlineGrid columns={{ xs: 1, sm: 2 }} gap="400">
           <Card>
             <BlockStack gap="300">
@@ -187,16 +203,8 @@ export default function Dashboard() {
               <Text as="p" variant="bodySm" tone="subdued">
                 Bulk translate using Google Translate or DeepL
               </Text>
-              <Link
-                to="/app/auto-translate"
-                style={{
-                  textDecoration: "none",
-                  color: "var(--p-color-text-emphasis)",
-                }}
-              >
-                <Text as="span" variant="bodyMd">
-                  Launch auto-translate →
-                </Text>
+              <Link to="/app/auto-translate" style={{ textDecoration: "none" }}>
+                <Button>Launch auto-translate</Button>
               </Link>
             </BlockStack>
           </Card>
@@ -209,16 +217,8 @@ export default function Dashboard() {
               <Text as="p" variant="bodySm" tone="subdued">
                 Swap product images per language or market
               </Text>
-              <Link
-                to="/app/images"
-                style={{
-                  textDecoration: "none",
-                  color: "var(--p-color-text-emphasis)",
-                }}
-              >
-                <Text as="span" variant="bodyMd">
-                  Manage images →
-                </Text>
+              <Link to="/app/images" style={{ textDecoration: "none" }}>
+                <Button>Manage images</Button>
               </Link>
             </BlockStack>
           </Card>

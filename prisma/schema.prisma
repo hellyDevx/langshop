@@ -101,3 +101,17 @@ model ImageTranslation {
   @@unique([shop, resourceId, imageId, locale, marketId])
   @@index([shop, resourceId])
 }
+
+model TranslationStats {
+  id              String   @id @default(uuid())
+  shop            String
+  resourceType    String
+  locale          String
+  totalSampled    Int      @default(0)
+  translatedCount Int      @default(0)
+  hasResources    Boolean  @default(false)
+  cachedAt        DateTime @default(now())
+
+  @@unique([shop, resourceType, locale])
+  @@index([shop, locale])
+}
