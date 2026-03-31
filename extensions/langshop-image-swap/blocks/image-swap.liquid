@@ -3,24 +3,15 @@
   Always loads. JS fetches translated images for current locale and swaps if available.
 {% endcomment %}
 
-{% if request.locale.iso_code != shop.locale %}
-  <style>
-    /* Hide product images briefly while translations load */
-    .product__media img,
-    .product-media-container img,
-    .product__media-wrapper img,
-    [data-media-id] img {
-      opacity: 0;
-      transition: opacity 0.2s ease;
-    }
-    .langshop-images-ready .product__media img,
-    .langshop-images-ready .product-media-container img,
-    .langshop-images-ready .product__media-wrapper img,
-    .langshop-images-ready [data-media-id] img {
-      opacity: 1;
-    }
-  </style>
-{% endif %}
+<style>
+  .langshop-hiding img {
+    opacity: 0 !important;
+    transition: opacity 0.2s ease;
+  }
+  .langshop-images-ready img {
+    opacity: 1 !important;
+  }
+</style>
 <script>
   window.__langshop = {
     locale: {{ request.locale.iso_code | json }},

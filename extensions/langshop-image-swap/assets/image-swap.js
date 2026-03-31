@@ -2,44 +2,37 @@
   var config = window.__langshop;
   if (!config || !config.locale) return;
 
-  // If on default locale and no cached data, skip early (but still check)
-  var isDefaultLocale = config.locale === config.shopLocale;
-
   // Only run on product pages
   var pathParts = window.location.pathname.split("/");
   var productsIndex = pathParts.indexOf("products");
-  if (productsIndex === -1) {
-    document.documentElement.classList.add("langshop-images-ready");
-    return;
-  }
+  if (productsIndex === -1) return;
 
   var productHandle = pathParts[productsIndex + 1];
-  if (!productHandle) {
-    document.documentElement.classList.add("langshop-images-ready");
-    return;
-  }
+  if (!productHandle) return;
   productHandle = productHandle.split("?")[0];
 
-  // Check localStorage cache first for instant swap
+  // Check localStorage cache first for instant swap (no flash)
   var cacheKey = "langshop_gallery_" + productHandle + "_" + config.locale;
   var cached = null;
   try {
     var raw = localStorage.getItem(cacheKey);
     if (raw) {
       var parsed = JSON.parse(raw);
-      if (parsed.ts && Date.now() - parsed.ts < 300000) { // 5 min cache
+      if (parsed.ts && Date.now() - parsed.ts < 300000) {
         cached = parsed.gallery;
       }
     }
   } catch (e) {}
 
+  // If we have cached translations, hide images immediately to prevent flash
   if (cached && cached.length > 0) {
-    // Instant swap from cache
+    var productMedia = document.querySelector(".product__media, .product-media-container, .product__media-wrapper, [data-media-id]");
+    if (productMedia) productMedia.classList.add("langshop-hiding");
     var urlMap = buildUrlMap(cached);
     waitForImagesAndSwap(urlMap);
   }
 
-  // Always fetch fresh data (updates cache for next visit)
+  // Fetch fresh data
   getProductId(productHandle, function (productId) {
     if (!productId) {
       revealImages();
@@ -47,7 +40,6 @@
     }
 
     fetchGallery(productId, config.locale, config.shop, function (gallery) {
-      // Cache the result
       try {
         localStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), gallery: gallery }));
       } catch (e) {}
@@ -62,27 +54,26 @@
     });
   });
 
-  // --- Functions ---
-
   function revealImages() {
+    document.querySelectorAll(".langshop-hiding").forEach(function (el) {
+      el.classList.remove("langshop-hiding");
+    });
     document.documentElement.classList.add("langshop-images-ready");
   }
 
   function waitForImagesAndSwap(urlMap) {
-    // Try immediately
     swapImages(urlMap);
 
-    // Also try after DOM is ready
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", function () {
         swapImages(urlMap);
         revealImages();
       });
     } else {
+      swapImages(urlMap);
       revealImages();
     }
 
-    // Watch for dynamic changes
     var observer = new MutationObserver(function () {
       swapImages(urlMap);
     });
@@ -91,7 +82,6 @@
       subtree: true,
     });
 
-    // Failsafe: reveal after 3 seconds even if swap hasn't happened
     setTimeout(revealImages, 3000);
   }
 
@@ -142,25 +132,10 @@
     var map = {};
     gallery.forEach(function (item) {
       if (item.originalUrl && item.translatedUrl) {
-        map[normalizeUrl(item.originalUrl)] = item.translatedUrl;
+        map[extractFilename(item.originalUrl)] = item.translatedUrl;
       }
     });
     return map;
-  }
-
-  function normalizeUrl(url) {
-    try {
-      var u = new URL(url, "https://placeholder.com");
-      var path = u.pathname
-        .replace(/_\d+x\d*/g, "")
-        .replace(/_\d*x\d+/g, "")
-        .replace(/_crop_[a-z]+/g, "")
-        .replace(/@\dx/g, "");
-      // Normalize hostname - Shopify uses both cdn.shopify.com and {store}.myshopify.com/cdn
-      return path.replace(/^\/cdn\/shop\//, "/s/files/").replace(/\/s\/files\/\d+\/\d+\/\d+\/\d+\//, "/");
-    } catch (e) {
-      return url;
-    }
   }
 
   function extractFilename(url) {
@@ -173,19 +148,8 @@
 
   function findMatch(src, urlMap) {
     if (!src) return null;
-
-    // Direct normalized match
-    var normalized = normalizeUrl(src);
-    for (var key in urlMap) {
-      if (normalizeUrl(key) === normalized) return urlMap[key];
-    }
-
-    // Filename match fallback
     var srcFile = extractFilename(src);
-    for (var key2 in urlMap) {
-      if (extractFilename(key2) === srcFile) return urlMap[key2];
-    }
-
+    if (urlMap[srcFile]) return urlMap[srcFile];
     return null;
   }
 
@@ -212,6 +176,10 @@
           })
           .join(", ");
         img.setAttribute("srcset", newSrcset);
+      }
+
+      if (img.hasAttribute("data-src")) {
+        img.setAttribute("data-src", newUrl);
       }
 
       var picture = img.closest("picture");
