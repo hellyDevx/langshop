@@ -3,8 +3,10 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import {
   useLoaderData,
   useFetcher,
+  useRouteError,
   useSearchParams,
 } from "@remix-run/react";
+import { boundary } from "@shopify/shopify-app-remix/server";
 import {
   Page,
   Layout,
@@ -45,7 +47,11 @@ import {
   getResourceConfig,
   getGidTypeFromSlug,
 } from "../utils/resource-type-map";
-import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
+import {
+  formatLocaleOptions,
+  getLocaleDisplayName,
+  isRtlLocale,
+} from "../utils/locale-utils";
 import { hashContent } from "../utils/content-hash";
 import { MarketSelector } from "../components/MarketSelector";
 import type { TranslationInput } from "../types/translation";
@@ -434,6 +440,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return json({ error: message }, { status: 500 });
   }
 };
+
+export function ErrorBoundary() {
+  return boundary.error(useRouteError());
+}
 
 export default function TranslationEditor() {
   const {
@@ -1015,25 +1025,27 @@ export default function TranslationEditor() {
                                 <Badge tone="warning">Outdated</Badge>
                               )}
                             </InlineStack>
-                            <TextField
-                              label=""
-                              labelHidden
-                              value={fieldValues[field.key] || ""}
-                              onChange={(val) =>
-                                setFieldValues((prev) => ({
-                                  ...prev,
-                                  [field.key]: val,
-                                }))
-                              }
-                              multiline={isMultiline ? 4 : false}
-                              autoComplete="off"
-                              placeholder={`Enter ${selectedLocale} translation...`}
-                              helpText={FIELD_HELP[field.key]}
-                              error={fieldValidationError(
-                                field.key,
-                                fieldValues[field.key] || "",
-                              )}
-                            />
+                            <div dir={isRtlLocale(selectedLocale) ? "rtl" : undefined}>
+                              <TextField
+                                label=""
+                                labelHidden
+                                value={fieldValues[field.key] || ""}
+                                onChange={(val) =>
+                                  setFieldValues((prev) => ({
+                                    ...prev,
+                                    [field.key]: val,
+                                  }))
+                                }
+                                multiline={isMultiline ? 4 : false}
+                                autoComplete="off"
+                                placeholder={`Enter ${selectedLocale} translation...`}
+                                helpText={FIELD_HELP[field.key]}
+                                error={fieldValidationError(
+                                  field.key,
+                                  fieldValues[field.key] || "",
+                                )}
+                              />
+                            </div>
                           </BlockStack>
                         </Box>
                       );
@@ -1124,30 +1136,32 @@ export default function TranslationEditor() {
                                           </Badge>
                                         )}
                                       </InlineStack>
-                                      <TextField
-                                        label=""
-                                        labelHidden
-                                        value={nrVals[field.key] || ""}
-                                        onChange={(val) =>
-                                          setNestedValues((prev) => ({
-                                            ...prev,
-                                            [nr.resourceId]: {
-                                              ...prev[nr.resourceId],
-                                              [field.key]: val,
-                                            },
-                                          }))
-                                        }
-                                        multiline={
-                                          field.value.length > 100 ? 3 : false
-                                        }
-                                        autoComplete="off"
-                                        placeholder={`${selectedLocale} translation...`}
-                                        helpText={FIELD_HELP[field.key]}
-                                        error={fieldValidationError(
-                                          field.key,
-                                          nrVals[field.key] || "",
-                                        )}
-                                      />
+                                      <div dir={isRtlLocale(selectedLocale) ? "rtl" : undefined}>
+                                        <TextField
+                                          label=""
+                                          labelHidden
+                                          value={nrVals[field.key] || ""}
+                                          onChange={(val) =>
+                                            setNestedValues((prev) => ({
+                                              ...prev,
+                                              [nr.resourceId]: {
+                                                ...prev[nr.resourceId],
+                                                [field.key]: val,
+                                              },
+                                            }))
+                                          }
+                                          multiline={
+                                            field.value.length > 100 ? 3 : false
+                                          }
+                                          autoComplete="off"
+                                          placeholder={`${selectedLocale} translation...`}
+                                          helpText={FIELD_HELP[field.key]}
+                                          error={fieldValidationError(
+                                            field.key,
+                                            nrVals[field.key] || "",
+                                          )}
+                                        />
+                                      </div>
                                     </BlockStack>
                                   </div>
                                 </InlineStack>

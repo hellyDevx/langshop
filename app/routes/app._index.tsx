@@ -19,6 +19,8 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { fetchShopLocales, fetchMarkets } from "../services/markets.server";
 import { fetchAllCategoryStats } from "../services/translatable-resources.server";
+import { getOnboardingState } from "../services/onboarding.server";
+import { TOTAL_STEPS } from "../utils/onboarding-constants";
 import { RESOURCE_CATEGORIES, getStatusBadge } from "../utils/resource-type-map";
 import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
 
@@ -26,9 +28,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
 
-  const [locales, markets] = await Promise.all([
+  const [locales, markets, onboarding] = await Promise.all([
     fetchShopLocales(admin),
     fetchMarkets(admin),
+    getOnboardingState(session.shop),
   ]);
 
   const selectedLocale =
@@ -50,11 +53,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     markets,
     selectedLocale,
     categoryStats,
+    onboarding,
   };
 };
 
 export default function Dashboard() {
-  const { locales, markets, selectedLocale, categoryStats } =
+  const { locales, markets, selectedLocale, categoryStats, onboarding } =
     useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -72,6 +76,19 @@ export default function Dashboard() {
     <Page>
       <TitleBar title="LangShop - Translation Manager" />
       <BlockStack gap="500">
+        {!onboarding.completedAt && (
+          <Banner
+            tone="info"
+            title="Finish setting up LangShop"
+            action={{ content: "Finish onboarding", url: "/app/onboarding" }}
+          >
+            <p>
+              Step {Math.min(onboarding.step + 1, TOTAL_STEPS)}/{TOTAL_STEPS} —
+              configure a provider and target languages to start translating.
+            </p>
+          </Banner>
+        )}
+
         {secondaryLocales.length === 0 && (
           <Banner tone="warning">
             <p>

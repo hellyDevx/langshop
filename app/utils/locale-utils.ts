@@ -38,6 +38,24 @@ const LOCALE_OVERRIDES: Record<string, string> = {
   ms: "Malay",
 };
 
+const RTL_LANGUAGES = new Set([
+  "ar",
+  "he",
+  "fa",
+  "ur",
+  "ps",
+  "yi",
+  "dv",
+  "syr",
+  "sd",
+]);
+
+export function isRtlLocale(locale: string | null | undefined): boolean {
+  if (!locale) return false;
+  const lang = locale.toLowerCase().split("-")[0];
+  return RTL_LANGUAGES.has(lang);
+}
+
 let intlDisplayNames: Intl.DisplayNames | null = null;
 function getIntlDisplayNames(): Intl.DisplayNames | null {
   if (intlDisplayNames) return intlDisplayNames;

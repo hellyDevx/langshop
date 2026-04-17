@@ -1,7 +1,13 @@
 import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useFetcher, useLoaderData } from "@remix-run/react";
+import {
+  useFetcher,
+  useLoaderData,
+  useNavigation,
+  useRouteError,
+} from "@remix-run/react";
+import { boundary } from "@shopify/shopify-app-remix/server";
 import {
   Badge,
   Banner,
@@ -14,6 +20,9 @@ import {
   Layout,
   Page,
   Select,
+  SkeletonBodyText,
+  SkeletonDisplayText,
+  SkeletonPage,
   Text,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
@@ -162,11 +171,31 @@ function columnLabel(
   return m ? m.name : value;
 }
 
+export function ErrorBoundary() {
+  return boundary.error(useRouteError());
+}
+
 export default function Analytics() {
   const data = useLoaderData<typeof loader>();
+  const navigation = useNavigation();
   const fetcher = useFetcher<ActionResponse>();
   const staleFetcher = useFetcher<ActionResponse>();
   const retranslateFetcher = useFetcher<ActionResponse>();
+
+  if (navigation.state === "loading" && !navigation.formMethod) {
+    return (
+      <SkeletonPage primaryAction>
+        <Layout>
+          <Layout.Section>
+            <BlockStack gap="400">
+              <SkeletonDisplayText size="small" />
+              <SkeletonBodyText lines={8} />
+            </BlockStack>
+          </Layout.Section>
+        </Layout>
+      </SkeletonPage>
+    );
+  }
 
   const [view, setView] = useState<"locale" | "market">(data.view);
   const [overrides, setOverrides] = useState<

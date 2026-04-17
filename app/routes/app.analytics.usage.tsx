@@ -1,10 +1,12 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useLoaderData } from "@remix-run/react";
+import { useLoaderData, useRouteError } from "@remix-run/react";
+import { boundary } from "@shopify/shopify-app-remix/server";
 import {
   Badge,
   BlockStack,
   Card,
+  EmptyState,
   InlineStack,
   Layout,
   Page,
@@ -27,6 +29,10 @@ function providerLabel(p: string): string {
   if (p === "claude") return "Claude";
   if (p === "openai") return "OpenAI";
   return p;
+}
+
+export function ErrorBoundary() {
+  return boundary.error(useRouteError());
 }
 
 export default function Usage() {
@@ -84,9 +90,12 @@ export default function Usage() {
                   Daily breakdown
                 </Text>
                 {rows.length === 0 ? (
-                  <Text as="p" tone="subdued">
-                    No rows.
-                  </Text>
+                  <EmptyState heading="No usage in the last 30 days" image="">
+                    <p>
+                      Usage appears once you run an auto-translate job or
+                      storefront translations flow through the app proxy.
+                    </p>
+                  </EmptyState>
                 ) : (
                   <table
                     style={{ width: "100%", borderCollapse: "collapse" }}

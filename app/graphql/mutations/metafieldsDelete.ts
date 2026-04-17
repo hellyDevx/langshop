@@ -1,0 +1,15 @@
+export const METAFIELDS_DELETE_MUTATION = `#graphql
+  mutation MetafieldsDelete($metafields: [MetafieldIdentifierInput!]!) {
+    metafieldsDelete(metafields: $metafields) {
+      deletedMetafields {
+        key
+        namespace
+        ownerId
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;

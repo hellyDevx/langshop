@@ -1,6 +1,14 @@
 import { useState, useMemo } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useActionData, useSubmit, useNavigation, useRevalidator } from "@remix-run/react";
+import {
+  useLoaderData,
+  useActionData,
+  useSubmit,
+  useNavigation,
+  useRevalidator,
+  useRouteError,
+} from "@remix-run/react";
+import { boundary } from "@shopify/shopify-app-remix/server";
 import { useJobProgress } from "../hooks/useJobProgress";
 import {
   Page,
@@ -14,6 +22,7 @@ import {
   Badge,
   InlineStack,
   IndexTable,
+  EmptyState,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { json } from "@remix-run/node";
@@ -115,6 +124,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return json({ error: "Unknown intent" }, { status: 400 });
 };
 
+export function ErrorBoundary() {
+  return boundary.error(useRouteError());
+}
+
 function jobProviderLabel(p: string): string {
   if (p === "google") return "Google";
   if (p === "deepl") return "DeepL";
@@ -203,6 +216,7 @@ export default function AutoTranslate() {
     <Page
       backAction={{ content: "Dashboard", url: "/app" }}
       title="Auto-Translate"
+      subtitle="Queue and monitor translation jobs across providers and markets."
     >
       <TitleBar title="Auto-Translate" />
       <BlockStack gap="500">
@@ -297,7 +311,17 @@ export default function AutoTranslate() {
           </BlockStack>
         </Card>
 
-        {jobs.length > 0 && (
+        {jobs.length === 0 ? (
+          <Card>
+            <EmptyState heading="No translation jobs yet" image="">
+              <p>
+                Pick a provider, resource type, and target language above to
+                queue your first auto-translate job. Progress appears here
+                when it's running.
+              </p>
+            </EmptyState>
+          </Card>
+        ) : (
           <Card>
             <BlockStack gap="400">
               <Text as="h2" variant="headingMd">

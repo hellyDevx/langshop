@@ -9,6 +9,7 @@ import {
   InlineStack,
   InlineGrid,
   Button,
+  EmptyState,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -31,13 +32,36 @@ export default function MarketsOverview() {
   const navigate = useNavigate();
 
   return (
-    <Page backAction={{ content: "Dashboard", url: "/app" }} title="Markets">
+    <Page
+      backAction={{ content: "Dashboard", url: "/app" }}
+      title="Markets"
+      subtitle="Manage market-scoped translations across your storefronts."
+    >
       <TitleBar title="Markets" />
       <BlockStack gap="500">
         <Text as="p" variant="bodyMd" tone="subdued">
           Manage translations per market. Market-specific translations override
           global translations for customers in that market.
         </Text>
+
+        {markets.length === 0 && (
+          <Card>
+            <EmptyState
+              heading="No markets configured"
+              image=""
+              action={{
+                content: "Open Shopify admin",
+                url: "https://admin.shopify.com/",
+                external: true,
+              }}
+            >
+              <p>
+                Configure Shopify Markets in your admin first. Each market can
+                have its own locales and translations.
+              </p>
+            </EmptyState>
+          </Card>
+        )}
 
         <InlineGrid columns={{ xs: 1, sm: 2 }} gap="400">
           {markets.map((market) => {
