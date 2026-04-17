@@ -48,6 +48,7 @@ async function tick(): Promise<void> {
       await runTranslationJob(claimed.job.id, {
         apiKey: claimed.providerConfig.apiKey,
         projectId: claimed.providerConfig.projectId ?? undefined,
+        model: claimed.providerConfig.model ?? undefined,
       });
     } catch (err) {
       console.error(`[scheduler] job ${claimed.job.id} failed:`, err);

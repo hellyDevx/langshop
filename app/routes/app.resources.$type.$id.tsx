@@ -22,12 +22,21 @@ import {
 import { TitleBar } from "@shopify/app-bridge-react";
 import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
 import {
   fetchTranslatableResource,
   fetchTranslatableResourceWithNested,
 } from "../services/translatable-resources.server";
 import { registerTranslations } from "../services/translation.server";
 import { fetchShopLocales, fetchMarkets } from "../services/markets.server";
+import {
+  acceptSuggestion,
+  getSuggestion,
+  listPendingSuggestions,
+  rejectSuggestion,
+} from "../services/suggestion.server";
+import { upsertContentDigest } from "../services/content-sync.server";
+import { createProvider } from "../services/providers/provider-interface.server";
 import {
   RESOURCE_TYPES,
   getResourceTypeFromSlug,
@@ -36,6 +45,7 @@ import {
   getGidTypeFromSlug,
 } from "../utils/resource-type-map";
 import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
+import { hashContent } from "../utils/content-hash";
 import { MarketSelector } from "../components/MarketSelector";
 import type { TranslationInput } from "../types/translation";
 
@@ -83,7 +93,7 @@ function fieldValidationError(key: string, value: string): string | undefined {
 }
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
   const locale = url.searchParams.get("locale");
   const marketId = url.searchParams.get("marketId") || null;
@@ -140,6 +150,25 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
   }
 
+  const [suggestions, machineProviders] = await Promise.all([
+    selectedLocale
+      ? listPendingSuggestions(
+          session.shop,
+          resourceId,
+          selectedLocale,
+          marketId,
+        )
+      : Promise.resolve([]),
+    prisma.translationProviderConfig.findMany({
+      where: {
+        shop: session.shop,
+        isActive: true,
+        provider: { in: ["google", "deepl"] },
+      },
+      select: { provider: true },
+    }),
+  ]);
+
   return {
     resource,
     nestedResources,
@@ -150,13 +179,131 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     markets,
     selectedLocale,
     selectedMarketId: marketId,
+    suggestions,
+    machineProviders: machineProviders.map((p) => p.provider),
   };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+  const intent = String(formData.get("intent") || "");
   const resourceId = buildResourceGid(params.type!, params.id!);
+
+  // ---- Suggestion-review intents ----
+  if (intent === "accept-suggestion" || intent === "accept-all") {
+    const ids =
+      intent === "accept-all"
+        ? String(formData.get("ids") || "")
+            .split(",")
+            .filter(Boolean)
+        : [String(formData.get("id") || "")];
+    if (ids.length === 0) {
+      return json({ error: "Missing suggestion id(s)." }, { status: 400 });
+    }
+
+    for (const id of ids) {
+      const suggestion = await getSuggestion(session.shop, id);
+      if (!suggestion || !suggestion.resourceId) continue;
+
+      const editedField = `editedValue_${id}`;
+      const editedValue = formData.has(editedField)
+        ? String(formData.get(editedField) || "")
+        : null;
+      const finalValue = editedValue ?? suggestion.suggestedValue;
+      const edited =
+        editedValue !== null && editedValue !== suggestion.suggestedValue;
+
+      // Need the current digest for translationsRegister. Fetch it on the fly.
+      const resource = await fetchTranslatableResource(admin, {
+        resourceId: suggestion.resourceId,
+        locale: suggestion.locale,
+        marketId: suggestion.marketId,
+      });
+      const digestField = resource?.translatableContent.find(
+        (f) => f.key === suggestion.fieldKey,
+      );
+      if (!digestField) {
+        return json(
+          {
+            error: `Field "${suggestion.fieldKey}" no longer exists on the resource.`,
+          },
+          { status: 400 },
+        );
+      }
+
+      const input: TranslationInput = {
+        key: suggestion.fieldKey,
+        value: finalValue,
+        locale: suggestion.locale,
+        translatableContentDigest: digestField.digest,
+      };
+      if (suggestion.marketId) input.marketId = suggestion.marketId;
+
+      await registerTranslations(admin, {
+        resourceId: suggestion.resourceId,
+        translations: [input],
+      });
+      await upsertContentDigest(
+        session.shop,
+        suggestion.resourceId,
+        suggestion.fieldKey,
+        hashContent(suggestion.sourceValue),
+      );
+      await acceptSuggestion(session.shop, id, finalValue, edited);
+    }
+
+    return json({ success: true, acceptedCount: ids.length });
+  }
+
+  if (intent === "reject-suggestion") {
+    const id = String(formData.get("id") || "");
+    const reason = formData.has("reason")
+      ? String(formData.get("reason") || "")
+      : null;
+    if (!id) {
+      return json({ error: "Missing suggestion id." }, { status: 400 });
+    }
+    await rejectSuggestion(session.shop, id, reason);
+    return json({ success: true, rejectedId: id });
+  }
+
+  if (intent === "compare") {
+    const fieldKey = String(formData.get("field") || "");
+    const providerName = String(formData.get("provider") || "");
+    const sourceValue = String(formData.get("sourceValue") || "");
+    const sourceLocale = String(formData.get("sourceLocale") || "");
+    const targetLocale = String(formData.get("targetLocale") || "");
+    if (!fieldKey || !providerName || !sourceValue || !targetLocale) {
+      return json({ error: "Missing compare parameters." }, { status: 400 });
+    }
+    const config = await prisma.translationProviderConfig.findUnique({
+      where: { shop_provider: { shop: session.shop, provider: providerName } },
+    });
+    if (!config) {
+      return json(
+        { error: `${providerName} is not configured.` },
+        { status: 400 },
+      );
+    }
+    try {
+      const provider = createProvider(providerName, {
+        apiKey: config.apiKey,
+        projectId: config.projectId ?? undefined,
+      });
+      const [translated] = await provider.translate(
+        [sourceValue],
+        sourceLocale,
+        targetLocale,
+      );
+      return json({ success: true, compareField: fieldKey, value: translated });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return json({ error: message }, { status: 500 });
+    }
+  }
+
+  // ---- Existing manual-save path (no intent) ----
   const locale = formData.get("locale") as string;
   const marketId = (formData.get("marketId") as string) || null;
 
@@ -249,9 +396,24 @@ export default function TranslationEditor() {
     markets,
     selectedLocale,
     selectedMarketId,
+    suggestions,
+    machineProviders,
   } = useLoaderData<typeof loader>();
 
-  const fetcher = useFetcher<{ success?: boolean; error?: string }>();
+  const fetcher = useFetcher<{
+    success?: boolean;
+    error?: string;
+    acceptedCount?: number;
+    rejectedId?: string;
+    compareField?: string;
+    value?: string;
+  }>();
+  const compareFetcher = useFetcher<{
+    success?: boolean;
+    error?: string;
+    compareField?: string;
+    value?: string;
+  }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const [optimisticSaved, setOptimisticSaved] = useState(false);
   const lastSavedRef = useRef<Record<string, string>>({});
@@ -358,6 +520,79 @@ export default function TranslationEditor() {
     ? getResourceDisplayName(resource.translatableContent)
     : "Resource";
 
+  // ---- AI suggestion review state ----
+  const [suggestionEdits, setSuggestionEdits] = useState<Record<string, string>>(
+    {},
+  );
+  const [rejectReason, setRejectReason] = useState<Record<string, string>>({});
+  const [compareValues, setCompareValues] = useState<
+    Record<string, { provider: string; text: string }>
+  >({});
+
+  useEffect(() => {
+    if (
+      compareFetcher.data?.success &&
+      compareFetcher.data.compareField &&
+      compareFetcher.data.value !== undefined
+    ) {
+      const field = compareFetcher.data.compareField;
+      const val = compareFetcher.data.value;
+      setCompareValues((prev) => ({
+        ...prev,
+        [field]: { provider: prev[field]?.provider || "google", text: val },
+      }));
+    }
+  }, [compareFetcher.data]);
+
+  const suggestionList = suggestions ?? [];
+
+  const getSuggestionValue = (id: string, fallback: string) =>
+    suggestionEdits[id] ?? fallback;
+
+  const submitAccept = (id: string, suggestedValue: string) => {
+    const fd = new FormData();
+    fd.set("intent", "accept-suggestion");
+    fd.set("id", id);
+    const currentValue = getSuggestionValue(id, suggestedValue);
+    if (currentValue !== suggestedValue) {
+      fd.set(`editedValue_${id}`, currentValue);
+    }
+    fetcher.submit(fd, { method: "POST" });
+  };
+
+  const submitReject = (id: string) => {
+    const fd = new FormData();
+    fd.set("intent", "reject-suggestion");
+    fd.set("id", id);
+    if (rejectReason[id]) fd.set("reason", rejectReason[id]);
+    fetcher.submit(fd, { method: "POST" });
+  };
+
+  const submitAcceptAll = () => {
+    if (suggestionList.length === 0) return;
+    const fd = new FormData();
+    fd.set("intent", "accept-all");
+    fd.set("ids", suggestionList.map((s) => s.id).join(","));
+    for (const s of suggestionList) {
+      const current = getSuggestionValue(s.id, s.suggestedValue);
+      if (current !== s.suggestedValue) {
+        fd.set(`editedValue_${s.id}`, current);
+      }
+    }
+    fetcher.submit(fd, { method: "POST" });
+  };
+
+  const submitCompare = (fieldKey: string, provider: string, source: string) => {
+    const fd = new FormData();
+    fd.set("intent", "compare");
+    fd.set("field", fieldKey);
+    fd.set("provider", provider);
+    fd.set("sourceValue", source);
+    fd.set("sourceLocale", locales.find((l) => l.primary)?.locale ?? "");
+    fd.set("targetLocale", selectedLocale ?? "");
+    compareFetcher.submit(fd, { method: "POST" });
+  };
+
   return (
     <Page
       backAction={{
@@ -399,6 +634,174 @@ export default function TranslationEditor() {
             </div>
           </InlineStack>
         </Card>
+
+        {suggestionList.length > 0 && selectedLocale && resource && (
+          <Card>
+            <BlockStack gap="400">
+              <InlineStack align="space-between" blockAlign="center">
+                <InlineStack gap="200" blockAlign="center">
+                  <Text as="h2" variant="headingMd">
+                    AI suggestions ({suggestionList.length})
+                  </Text>
+                  <Badge tone="info">Pending review</Badge>
+                </InlineStack>
+                <Button
+                  variant="primary"
+                  onClick={submitAcceptAll}
+                  loading={isSubmitting}
+                >
+                  Accept all
+                </Button>
+              </InlineStack>
+              {suggestionList.map((s) => {
+                const currentValue = getSuggestionValue(s.id, s.suggestedValue);
+                const edited = currentValue !== s.suggestedValue;
+                const compare = compareValues[s.fieldKey];
+                return (
+                  <Box
+                    key={s.id}
+                    padding="400"
+                    background="bg-surface-secondary"
+                    borderRadius="200"
+                  >
+                    <BlockStack gap="300">
+                      <InlineStack gap="200" blockAlign="center">
+                        <Text as="span" variant="bodySm" tone="subdued">
+                          {fieldDisplayLabel(s.fieldKey)}
+                        </Text>
+                        <Badge>{s.provider}</Badge>
+                        {edited && <Badge tone="attention">Edited</Badge>}
+                      </InlineStack>
+                      <InlineStack gap="400" align="start" wrap>
+                        <div style={{ flex: 1, minWidth: 220 }}>
+                          <BlockStack gap="100">
+                            <Text as="span" variant="bodySm" tone="subdued">
+                              Source
+                            </Text>
+                            <Box
+                              padding="300"
+                              background="bg-surface"
+                              borderRadius="200"
+                            >
+                              <Text as="p" variant="bodyMd" breakWord>
+                                {s.sourceValue.length > 300
+                                  ? s.sourceValue.substring(0, 300) + "..."
+                                  : s.sourceValue}
+                              </Text>
+                            </Box>
+                          </BlockStack>
+                        </div>
+                        <div style={{ flex: 1, minWidth: 220 }}>
+                          <BlockStack gap="100">
+                            <Text as="span" variant="bodySm" tone="subdued">
+                              AI suggestion
+                            </Text>
+                            <TextField
+                              label=""
+                              labelHidden
+                              value={currentValue}
+                              onChange={(v) =>
+                                setSuggestionEdits((prev) => ({
+                                  ...prev,
+                                  [s.id]: v,
+                                }))
+                              }
+                              multiline={currentValue.length > 100 ? 4 : false}
+                              autoComplete="off"
+                            />
+                          </BlockStack>
+                        </div>
+                        <div style={{ flex: 1, minWidth: 220 }}>
+                          <BlockStack gap="100">
+                            <Text as="span" variant="bodySm" tone="subdued">
+                              Current translation
+                            </Text>
+                            <Box
+                              padding="300"
+                              background="bg-surface"
+                              borderRadius="200"
+                            >
+                              <Text as="p" variant="bodyMd" breakWord>
+                                {translationMap[s.fieldKey]?.value ||
+                                  "— no current translation —"}
+                              </Text>
+                            </Box>
+                            {compare && (
+                              <Box
+                                padding="300"
+                                background="bg-surface-active"
+                                borderRadius="200"
+                              >
+                                <BlockStack gap="100">
+                                  <Text
+                                    as="span"
+                                    variant="bodySm"
+                                    tone="subdued"
+                                  >
+                                    {compare.provider} translation
+                                  </Text>
+                                  <Text as="p" variant="bodyMd" breakWord>
+                                    {compare.text}
+                                  </Text>
+                                </BlockStack>
+                              </Box>
+                            )}
+                          </BlockStack>
+                        </div>
+                      </InlineStack>
+                      <InlineStack gap="200" align="end" wrap>
+                        {machineProviders.length > 0 && (
+                          <Select
+                            label="Compare with"
+                            labelHidden
+                            options={[
+                              { label: "Compare with…", value: "" },
+                              ...machineProviders.map((p) => ({
+                                label:
+                                  p === "google" ? "Google Translate" : "DeepL",
+                                value: p,
+                              })),
+                            ]}
+                            value=""
+                            onChange={(v) => {
+                              if (v) {
+                                submitCompare(s.fieldKey, v, s.sourceValue);
+                              }
+                            }}
+                          />
+                        )}
+                        <TextField
+                          label="Rejection reason"
+                          labelHidden
+                          placeholder="Reason (optional)"
+                          value={rejectReason[s.id] || ""}
+                          onChange={(v) =>
+                            setRejectReason((prev) => ({ ...prev, [s.id]: v }))
+                          }
+                          autoComplete="off"
+                        />
+                        <Button
+                          tone="critical"
+                          onClick={() => submitReject(s.id)}
+                        >
+                          Reject
+                        </Button>
+                        <Button
+                          variant="primary"
+                          onClick={() =>
+                            submitAccept(s.id, s.suggestedValue)
+                          }
+                        >
+                          {edited ? "Save & Accept" : "Accept"}
+                        </Button>
+                      </InlineStack>
+                    </BlockStack>
+                  </Box>
+                );
+              })}
+            </BlockStack>
+          </Card>
+        )}
 
         {!selectedLocale ? (
           <Banner>Please select a target language to start translating.</Banner>

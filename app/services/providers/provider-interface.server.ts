@@ -3,6 +3,7 @@ import type {
   ProviderConfig,
   Language,
 } from "../../types/provider";
+import { createAiProvider } from "./ai-provider.server";
 
 export class ProviderTransientError extends Error {
   readonly status: number;
@@ -17,15 +18,23 @@ function isTransientStatus(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
+export function isAiProvider(providerType: string): boolean {
+  return providerType === "claude" || providerType === "openai";
+}
+
 export function createProvider(
   providerType: string,
   config: ProviderConfig,
+  model?: string,
 ): TranslationProvider {
   switch (providerType) {
     case "google":
       return createGoogleProvider(config);
     case "deepl":
       return createDeepLProvider(config);
+    case "claude":
+    case "openai":
+      return createAiProvider(providerType, config, model);
     default:
       throw new Error(`Unknown provider: ${providerType}`);
   }

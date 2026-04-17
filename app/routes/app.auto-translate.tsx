@@ -24,8 +24,13 @@ import {
   getJobsForShop,
 } from "../services/auto-translate.server";
 import prisma from "../db.server";
+import { isAiProvider } from "../services/providers/provider-interface.server";
 import { RESOURCE_TYPES } from "../utils/resource-type-map";
 import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
+import {
+  DEFAULT_MODEL_FOR_PROVIDER,
+  estimateCost,
+} from "../utils/cost-estimator";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -39,6 +44,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
   ]);
 
+  const providerLabelFor = (p: string): string => {
+    if (p === "google") return "Google Translate";
+    if (p === "deepl") return "DeepL";
+    if (p === "claude") return "Claude (AI)";
+    if (p === "openai") return "OpenAI (AI)";
+    return p;
+  };
+
   return {
     locales,
     markets,
@@ -46,7 +59,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     hasProviders: providerConfigs.length > 0,
     providers: providerConfigs.map((p) => ({
       provider: p.provider,
-      label: p.provider === "google" ? "Google Translate" : "DeepL",
+      label: providerLabelFor(p.provider),
+      model: p.model ?? DEFAULT_MODEL_FOR_PROVIDER[p.provider] ?? null,
+      isAi: isAiProvider(p.provider),
     })),
   };
 };
@@ -100,6 +115,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return json({ error: "Unknown intent" }, { status: 400 });
 };
 
+function jobProviderLabel(p: string): string {
+  if (p === "google") return "Google";
+  if (p === "deepl") return "DeepL";
+  if (p === "claude") return "Claude";
+  if (p === "openai") return "OpenAI";
+  return p;
+}
+
 export default function AutoTranslate() {
   const { locales, markets, jobs, hasProviders, providers } =
     useLoaderData<typeof loader>();
@@ -139,6 +162,13 @@ export default function AutoTranslate() {
       value: key,
     }),
   );
+
+  const selectedProvider = providers.find((p) => p.provider === provider);
+  const isAi = selectedProvider?.isAi ?? false;
+  const costEstimate =
+    isAi && selectedProvider?.model
+      ? estimateCost(selectedProvider.model, 50_000)
+      : null;
 
   const marketOptions = [
     { label: "Global (all markets)", value: "" },
@@ -240,13 +270,29 @@ export default function AutoTranslate() {
               helpText="Leave as Global to translate for all markets"
             />
 
+            {isAi && (
+              <Banner tone="info">
+                AI translations are written to a review queue. Open the resource
+                in the translation editor to Accept, Edit & Accept, or Reject each
+                suggestion before it goes live.
+                {costEstimate && (
+                  <>
+                    {" "}
+                    Estimated cost for ~50,000 characters:{" "}
+                    <strong>${costEstimate.usd.toFixed(2)}</strong>.{" "}
+                    {costEstimate.note}
+                  </>
+                )}
+              </Banner>
+            )}
+
             <Button
               variant="primary"
               onClick={handleSubmit}
               loading={isSubmitting}
               disabled={!hasProviders || !targetLocale || !provider}
             >
-              Start Auto-Translate
+              {isAi ? "Generate Suggestions" : "Start Auto-Translate"}
             </Button>
           </BlockStack>
         </Card>
@@ -299,9 +345,7 @@ export default function AutoTranslate() {
                         {getLocaleDisplayName(job.targetLocale)}
                       </IndexTable.Cell>
                       <IndexTable.Cell>
-                        {job.provider === "google"
-                          ? "Google"
-                          : "DeepL"}
+                        {jobProviderLabel(job.provider)}
                       </IndexTable.Cell>
                       <IndexTable.Cell>
                         <Badge

@@ -85,6 +85,7 @@ model TranslationProviderConfig {
   projectId      String?
   isActive       Boolean   @default(true)
   displayName    String?
+  model          String?
   monthlyQuota   Int?
   quotaUsed      Int       @default(0)
   quotaResetDate DateTime?

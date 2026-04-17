@@ -7,8 +7,10 @@ import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import {
   createProvider,
+  isAiProvider,
   ProviderTransientError,
 } from "./providers/provider-interface.server";
+import type { AiTranslationProvider } from "./providers/ai-provider.server";
 import { upsertContentDigest } from "./content-sync.server";
 import {
   applyGlossaryPost,
@@ -16,7 +18,11 @@ import {
   getGlossaryTermsByLocalePair,
   type ViolationWarning,
 } from "./glossary.server";
+import { getBrandVoiceConfig, buildAISystemPrompt } from "./brand-voice.server";
+import { upsertSuggestion } from "./suggestion.server";
+import { recordProviderUsage } from "./usage.server";
 import { hashContent } from "../utils/content-hash";
+import type { ProductContext } from "../utils/graphql-batcher";
 import { TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/translatableResources";
 import { TRANSLATIONS_REGISTER_MUTATION } from "../graphql/mutations/translationsRegister";
 import { batchFetchTranslatableResources } from "../utils/graphql-batcher";
@@ -54,6 +60,7 @@ interface FreshResource {
     digest: string;
     locale: string;
   }>;
+  productContext?: ProductContext;
 }
 
 export async function createTranslationJob(
@@ -224,7 +231,7 @@ export async function scheduleRetry(
 
 export async function runTranslationJob(
   jobId: string,
-  providerConfig: ProviderConfig,
+  providerConfig: ProviderConfig & { model?: string },
 ) {
   const job = await prisma.translationJob.findUnique({
     where: { id: jobId },
@@ -232,7 +239,11 @@ export async function runTranslationJob(
   if (!job) throw new Error("Job not found");
 
   const { admin } = await unauthenticated.admin(job.shop);
-  const provider = createProvider(job.provider, providerConfig);
+  const provider = createProvider(
+    job.provider,
+    providerConfig,
+    providerConfig.model,
+  );
 
   const glossaryRules = await getGlossaryTermsByLocalePair(
     job.shop,
@@ -240,6 +251,17 @@ export async function runTranslationJob(
     job.targetLocale,
   );
   let glossaryApplied = false;
+
+  const useAi = isAiProvider(job.provider);
+  let aiSystemPrompt: string | null = null;
+  if (useAi) {
+    const brandVoice = await getBrandVoiceConfig(job.shop);
+    aiSystemPrompt = buildAISystemPrompt(brandVoice, glossaryRules, {
+      resourceType: job.resourceType,
+      sourceLocale: job.sourceLocale,
+      targetLocale: job.targetLocale,
+    });
+  }
 
   let cursor: string | null = null;
   let totalProcessed = 0;
@@ -273,6 +295,7 @@ export async function runTranslationJob(
         admin,
         resourceIds,
         job.targetLocale,
+        { includeProductContext: useAi && job.resourceType === "PRODUCT" },
       );
 
       for (const resource of nodes) {
@@ -280,17 +303,31 @@ export async function runTranslationJob(
           const freshResource = batchedResources[resource.resourceId];
           if (!freshResource) throw new Error("Resource not found in batch");
 
-          const resourceStats = await translateResourceFromData(
-            admin,
-            provider,
-            freshResource,
-            job.shop,
-            job.sourceLocale,
-            job.targetLocale,
-            job.marketId,
-            jobId,
-            glossaryRules,
-          );
+          const resourceStats = useAi
+            ? await translateResourceAi(
+                provider as AiTranslationProvider,
+                freshResource,
+                job.shop,
+                job.sourceLocale,
+                job.targetLocale,
+                job.marketId,
+                job.resourceType,
+                job.provider,
+                aiSystemPrompt ?? "",
+                glossaryRules,
+              )
+            : await translateResourceFromData(
+                admin,
+                provider,
+                freshResource,
+                job.shop,
+                job.sourceLocale,
+                job.targetLocale,
+                job.marketId,
+                jobId,
+                glossaryRules,
+                job.provider,
+              );
           if (resourceStats.glossaryMatched) glossaryApplied = true;
           totalProcessed++;
         } catch (error) {
@@ -383,6 +420,7 @@ async function translateResourceFromData(
   marketId: string | null,
   jobId: string,
   glossaryRules: GlossaryTerm[],
+  jobProvider: string,
 ): Promise<ResourceTranslationStats> {
   const translatableFields = freshResource.translatableContent.filter(
     (c) => c.value && c.value.trim() !== "",
@@ -400,11 +438,13 @@ async function translateResourceFromData(
   });
 
   const maskedTexts = preResults.map((p) => p.masked);
+  const charCount = maskedTexts.reduce((sum, t) => sum + t.length, 0);
   const providerOutputs = await provider.translate(
     maskedTexts,
     sourceLocale,
     targetLocale,
   );
+  await recordProviderUsage(shop, jobProvider, targetLocale, charCount);
 
   const postResults = providerOutputs.map((out, i) =>
     applyGlossaryPost(out, preResults[i].placeholderMap, glossaryRules),
@@ -472,6 +512,97 @@ async function translateResourceFromData(
       field.key,
       hashContent(field.value),
     );
+  }
+
+  return { glossaryMatched };
+}
+
+async function translateResourceAi(
+  provider: AiTranslationProvider,
+  freshResource: FreshResource,
+  shop: string,
+  sourceLocale: string,
+  targetLocale: string,
+  marketId: string | null,
+  resourceType: string,
+  jobProvider: string,
+  baseSystemPrompt: string,
+  glossaryRules: GlossaryTerm[],
+): Promise<ResourceTranslationStats> {
+  const translatableFields = freshResource.translatableContent.filter(
+    (c) => c.value && c.value.trim() !== "",
+  );
+  if (translatableFields.length === 0) {
+    return { glossaryMatched: false };
+  }
+
+  let glossaryMatched = false;
+  const preResults = translatableFields.map((f) => {
+    const pre = applyGlossaryPre(f.value, glossaryRules);
+    if (pre.placeholderMap.length > 0) glossaryMatched = true;
+    return pre;
+  });
+
+  const maskedTexts = preResults.map((p) => p.masked);
+  const charCount = maskedTexts.reduce((sum, t) => sum + t.length, 0);
+
+  // Append per-resource context (product type / tags / collections) to the
+  // cached base prompt. Appending keeps the base prefix byte-identical for
+  // cache reuse — only the suffix varies by resource.
+  let systemPrompt = baseSystemPrompt;
+  if (freshResource.productContext) {
+    const { productType, tags, collections } = freshResource.productContext;
+    const lines: string[] = ["Product context:"];
+    if (productType) lines.push(`- Category: ${productType}`);
+    if (tags.length > 0) lines.push(`- Tags: ${tags.join(", ")}`);
+    if (collections.length > 0) {
+      lines.push(`- Collections: ${collections.join(", ")}`);
+    }
+    if (lines.length > 1) {
+      systemPrompt = `${baseSystemPrompt}\n\n${lines.join("\n")}`;
+    }
+  }
+
+  const result = await provider.translateWithContext(
+    maskedTexts,
+    sourceLocale,
+    targetLocale,
+    systemPrompt,
+    freshResource.productContext
+      ? {
+          resourceType,
+          category: freshResource.productContext.productType ?? undefined,
+          tags: freshResource.productContext.tags,
+          collection: freshResource.productContext.collections[0],
+        }
+      : { resourceType },
+  );
+
+  await recordProviderUsage(shop, jobProvider, targetLocale, charCount);
+
+  const postResults = result.translations.map((out, i) =>
+    applyGlossaryPost(out, preResults[i].placeholderMap, glossaryRules),
+  );
+  if (postResults.some((r) => r.violations.length > 0)) {
+    glossaryMatched = true;
+  }
+  const translatedTexts = postResults.map((r) => r.restored);
+
+  for (let i = 0; i < translatableFields.length; i++) {
+    const field = translatableFields[i];
+    const suggested = translatedTexts[i];
+    if (!suggested) continue;
+    await upsertSuggestion({
+      shop,
+      resourceId: freshResource.resourceId,
+      resourceType,
+      fieldKey: field.key,
+      locale: targetLocale,
+      marketId,
+      sourceValue: field.value,
+      suggestedValue: suggested,
+      provider: jobProvider,
+    });
   }
 
   return { glossaryMatched };
