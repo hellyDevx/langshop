@@ -245,3 +245,12 @@ model OnboardingState {
   completedAt      DateTime?
   createdAt        DateTime  @default(now())
 }
+
+model ThirdPartyConfig {
+  id                  String   @id @default(uuid())
+  shop                String   @unique
+  presetsJson         String   @default("{}")
+  customSelectorsJson String   @default("[]")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}

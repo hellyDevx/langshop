@@ -1,0 +1,108 @@
+{% comment %}
+  LangShop Language Switcher — merchant-placed section block.
+  Renders shop.published_locales server-side; JS handles dropdown toggle
+  and optional auto-detect / auto-redirect.
+{% endcomment %}
+
+{% assign display_mode = block.settings.display_mode | default: "dropdown_with_text" %}
+{% assign current_locale = request.locale.iso_code %}
+{% assign auto_detect = block.settings.auto_detect %}
+{% assign auto_redirect = block.settings.auto_redirect %}
+
+<div
+  class="langshop-switcher langshop-switcher--{{ display_mode }}"
+  data-current-locale="{{ current_locale }}"
+  data-auto-detect="{{ auto_detect }}"
+  data-auto-redirect="{{ auto_redirect }}"
+>
+  {% if display_mode == "dropdown_with_text" or display_mode == "dropdown_with_flags" %}
+    <button
+      class="langshop-switcher__button"
+      type="button"
+      aria-haspopup="listbox"
+      aria-expanded="false"
+    >
+      <span class="langshop-switcher__current">
+        {%- for locale in shop.published_locales -%}
+          {%- if locale.iso_code == current_locale -%}
+            {%- if display_mode == "dropdown_with_flags" -%}
+              <span class="langshop-switcher__flag">{{ locale.iso_code | slice: 0, 2 | upcase }}</span>
+            {%- endif -%}
+            {{ locale.endonym_name }}
+          {%- endif -%}
+        {%- endfor -%}
+      </span>
+      <span class="langshop-switcher__chevron" aria-hidden="true">▾</span>
+    </button>
+    <ul class="langshop-switcher__list" role="listbox" hidden>
+      {% for locale in shop.published_locales %}
+        <li role="option" aria-selected="{% if locale.iso_code == current_locale %}true{% else %}false{% endif %}">
+          <a
+            href="{{ request.path }}?locale={{ locale.iso_code }}"
+            hreflang="{{ locale.iso_code }}"
+            class="langshop-switcher__item{% if locale.iso_code == current_locale %} is-active{% endif %}"
+          >
+            {% if display_mode == "dropdown_with_flags" %}
+              <span class="langshop-switcher__flag">{{ locale.iso_code | slice: 0, 2 | upcase }}</span>
+            {% endif %}
+            <span>{{ locale.endonym_name }}</span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% elsif display_mode == "inline_pills" or display_mode == "flags_only" %}
+    <div class="langshop-switcher__pills">
+      {% for locale in shop.published_locales %}
+        <a
+          href="{{ request.path }}?locale={{ locale.iso_code }}"
+          hreflang="{{ locale.iso_code }}"
+          class="langshop-switcher__pill{% if locale.iso_code == current_locale %} is-active{% endif %}"
+        >
+          {% if display_mode == "flags_only" %}
+            {{ locale.iso_code | slice: 0, 2 | upcase }}
+          {% else %}
+            {{ locale.endonym_name }}
+          {% endif %}
+        </a>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+
+{{ 'switcher.css' | asset_url | stylesheet_tag }}
+<script src="{{ 'switcher.js' | asset_url }}" defer></script>
+
+{% schema %}
+{
+  "name": "LangShop Switcher",
+  "target": "section",
+  "settings": [
+    {
+      "type": "select",
+      "id": "display_mode",
+      "label": "Display mode",
+      "options": [
+        { "value": "dropdown_with_text", "label": "Dropdown + language name" },
+        { "value": "dropdown_with_flags", "label": "Dropdown + flags" },
+        { "value": "inline_pills", "label": "Inline pills" },
+        { "value": "flags_only", "label": "Flags only" }
+      ],
+      "default": "dropdown_with_text"
+    },
+    {
+      "type": "checkbox",
+      "id": "auto_detect",
+      "label": "Auto-detect visitor's language",
+      "default": false,
+      "info": "Uses Shopify Markets country or browser language. Stored in localStorage on first visit."
+    },
+    {
+      "type": "checkbox",
+      "id": "auto_redirect",
+      "label": "Auto-redirect first-time visitors to their detected locale",
+      "default": false,
+      "info": "Requires Auto-detect to be enabled."
+    }
+  ]
+}
+{% endschema %}

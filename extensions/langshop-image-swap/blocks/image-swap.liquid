@@ -18,10 +18,12 @@
     shopLocale: {{ shop.locale | json }},
     shop: {{ shop.permanent_domain | json }},
     marketId: {{ localization.market.id | json }},
-    marketHandle: {{ localization.market.handle | json }}
+    marketHandle: {{ localization.market.handle | json }},
+    thirdPartySelectors: {{ shop.metafields.langshop.third_party_config.value.selectors | default: empty | json }}
   };
 </script>
 <script src="{{ 'image-swap.js' | asset_url }}" defer></script>
+<script src="{{ 'third-party.js' | asset_url }}" defer></script>
 
 {% schema %}
 {

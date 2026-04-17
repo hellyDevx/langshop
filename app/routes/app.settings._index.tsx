@@ -17,6 +17,7 @@ import {
   InlineStack,
   Badge,
   Select,
+  Checkbox,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { json } from "@remix-run/node";
@@ -27,6 +28,15 @@ import {
   AVAILABLE_MODELS,
   DEFAULT_MODEL_FOR_PROVIDER,
 } from "../utils/cost-estimator";
+import {
+  getThirdPartyConfig,
+  saveThirdPartyConfig,
+  writeStorefrontMetafield,
+} from "../services/third-party-config.server";
+import {
+  DEFAULT_THIRD_PARTY_CONFIG,
+  type ThirdPartyConfigShape,
+} from "../utils/third-party-constants";
 
 type ActionData =
   | { success: string }
@@ -37,9 +47,12 @@ type ActionData =
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
 
-  const configs = await prisma.translationProviderConfig.findMany({
-    where: { shop: session.shop },
-  });
+  const [configs, thirdParty] = await Promise.all([
+    prisma.translationProviderConfig.findMany({
+      where: { shop: session.shop },
+    }),
+    getThirdPartyConfig(session.shop),
+  ]);
 
   const find = (provider: string) => configs.find((c) => c.provider === provider);
 
@@ -75,11 +88,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           model: openai.model ?? DEFAULT_MODEL_FOR_PROVIDER.openai,
         }
       : null,
+    thirdParty,
   });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
 
@@ -178,11 +192,53 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ removed: provider });
   }
 
+  if (intent === "save-third-party") {
+    const presetsRaw = String(formData.get("presets") || "{}");
+    const customRaw = String(formData.get("customSelectors") || "");
+    let presets: ThirdPartyConfigShape["presets"];
+    try {
+      presets = JSON.parse(presetsRaw) as ThirdPartyConfigShape["presets"];
+    } catch {
+      return json({ error: "Invalid presets payload" }, { status: 400 });
+    }
+    const customSelectors = customRaw
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const config: ThirdPartyConfigShape = { presets, customSelectors };
+    await saveThirdPartyConfig(session.shop, config);
+
+    try {
+      const shopGid = `gid://shopify/Shop/${session.shop.split(".")[0]}`;
+      // Shop GID is actually the numeric shop ID, not the subdomain. Fetch it.
+      const shopResponse = await admin.graphql(
+        `#graphql
+          query ShopId { shop { id } }
+        `,
+      );
+      const shopData = (await shopResponse.json()) as {
+        data: { shop: { id: string } };
+      };
+      const actualShopGid = shopData.data.shop.id ?? shopGid;
+      await writeStorefrontMetafield(admin, actualShopGid, config);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return json(
+        { error: `Saved locally but metafield write failed: ${message}` },
+        { status: 500 },
+      );
+    }
+
+    return json({ success: "third-party" });
+  }
+
   return json({ error: "Unknown action" }, { status: 400 });
 };
 
 export default function Settings() {
-  const { google, deepl, claude, openai } = useLoaderData<typeof loader>();
+  const { google, deepl, claude, openai, thirdParty } =
+    useLoaderData<typeof loader>();
   const actionData = useActionData<ActionData>();
   const submit = useSubmit();
   const navigation = useNavigation();
@@ -198,6 +254,27 @@ export default function Settings() {
   const [openaiModel, setOpenaiModel] = useState(
     DEFAULT_MODEL_FOR_PROVIDER.openai,
   );
+
+  const [thirdPartyState, setThirdPartyState] = useState(
+    thirdParty ?? DEFAULT_THIRD_PARTY_CONFIG,
+  );
+  const [customSelectorsText, setCustomSelectorsText] = useState(
+    (thirdParty?.customSelectors ?? []).join("\n"),
+  );
+
+  const togglePreset = (key: keyof ThirdPartyConfigShape["presets"]) => {
+    setThirdPartyState((prev) => ({
+      ...prev,
+      presets: { ...prev.presets, [key]: !prev.presets[key] },
+    }));
+  };
+
+  const saveThirdParty = () => {
+    handleSave("save-third-party", {
+      presets: JSON.stringify(thirdPartyState.presets),
+      customSelectors: customSelectorsText,
+    });
+  };
 
   const isSubmitting = navigation.state === "submitting";
 
@@ -488,6 +565,65 @@ export default function Settings() {
             </Text>
             <InlineStack align="end">
               <Button url="/app/settings/brand-voice">Configure</Button>
+            </InlineStack>
+          </BlockStack>
+        </Card>
+
+        <Card>
+          <BlockStack gap="400">
+            <InlineStack align="space-between" blockAlign="center">
+              <Text as="h2" variant="headingMd">
+                Third-party content
+              </Text>
+              <Badge>Storefront</Badge>
+            </InlineStack>
+            <Text as="p" variant="bodyMd" tone="subdued">
+              Translate content injected by other apps on your storefront
+              (reviews, page builders). Requires a Google or DeepL API key and
+              the LangShop app embed active on your theme.
+            </Text>
+
+            <BlockStack gap="200">
+              <Checkbox
+                label="Judge.me reviews"
+                checked={!!thirdPartyState.presets.judgeme}
+                onChange={() => togglePreset("judgeme")}
+              />
+              <Checkbox
+                label="PageFly page builder"
+                checked={!!thirdPartyState.presets.pagefly}
+                onChange={() => togglePreset("pagefly")}
+              />
+              <Checkbox
+                label="GemPages page builder"
+                checked={!!thirdPartyState.presets.gempages}
+                onChange={() => togglePreset("gempages")}
+              />
+              <Checkbox
+                label="Yotpo reviews"
+                checked={!!thirdPartyState.presets.yotpo}
+                onChange={() => togglePreset("yotpo")}
+              />
+            </BlockStack>
+
+            <TextField
+              label="Custom selectors"
+              value={customSelectorsText}
+              onChange={setCustomSelectorsText}
+              multiline={4}
+              autoComplete="off"
+              helpText="One CSS selector per line — e.g. .my-review-widget"
+              placeholder=".my-widget&#10;#custom-reviews"
+            />
+
+            <InlineStack align="end">
+              <Button
+                variant="primary"
+                onClick={saveThirdParty}
+                loading={isSubmitting}
+              >
+                Save third-party config
+              </Button>
             </InlineStack>
           </BlockStack>
         </Card>

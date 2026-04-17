@@ -1,0 +1,10 @@
+api_version = "2026-04"
+
+[[extensions]]
+type = "theme"
+name = "LangShop Language Switcher"
+handle = "langshop-switcher"
+
+  [extensions.capabilities]
+  block = true
+  app_embed = false
