@@ -44,3 +44,7 @@ export async function getMarketLocaleMapping(
 
   return mapping;
 }
+
+export function getMarketLocales(market: Market): string[] {
+  return market.webPresence?.rootUrls.map((r) => r.locale) || [];
+}

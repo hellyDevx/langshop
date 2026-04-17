@@ -12,7 +12,8 @@
   productHandle = productHandle.split("?")[0];
 
   // Check localStorage cache first for instant swap (no flash)
-  var cacheKey = "langshop_gallery_" + productHandle + "_" + config.locale;
+  var marketSuffix = config.marketId ? "_m" + config.marketId : "";
+  var cacheKey = "langshop_gallery_" + productHandle + "_" + config.locale + marketSuffix;
   var cached = null;
   try {
     var raw = localStorage.getItem(cacheKey);
@@ -39,7 +40,7 @@
       return;
     }
 
-    fetchGallery(productId, config.locale, config.shop, function (gallery) {
+    fetchGallery(productId, config.locale, config.shop, config.marketId, function (gallery) {
       try {
         localStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), gallery: gallery }));
       } catch (e) {}
@@ -108,12 +109,13 @@
       .catch(function () { callback(null); });
   }
 
-  function fetchGallery(productId, locale, shop, callback) {
+  function fetchGallery(productId, locale, shop, marketId, callback) {
     var apiUrl =
       "/apps/langshop/api/image-gallery" +
       "?shop=" + encodeURIComponent(shop) +
       "&productId=" + encodeURIComponent(productId) +
-      "&locale=" + encodeURIComponent(locale);
+      "&locale=" + encodeURIComponent(locale) +
+      (marketId ? "&marketId=" + encodeURIComponent(marketId) : "");
 
     fetch(apiUrl)
       .then(function (r) {

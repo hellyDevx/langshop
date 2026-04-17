@@ -19,3 +19,25 @@ export const TRANSLATABLE_RESOURCES_QUERY = `#graphql
     }
   }
 `;
+
+export const TRANSLATABLE_RESOURCES_BACKWARD_QUERY = `#graphql
+  query TranslatableResourcesBackward($resourceType: TranslatableResourceType!, $last: Int!, $before: String) {
+    translatableResources(resourceType: $resourceType, last: $last, before: $before) {
+      nodes {
+        resourceId
+        translatableContent {
+          key
+          value
+          digest
+          locale
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+`;

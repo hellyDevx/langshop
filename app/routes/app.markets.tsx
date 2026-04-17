@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData } from "@remix-run/react";
+import { useLoaderData, useNavigate } from "@remix-run/react";
 import {
   Page,
   Card,
@@ -8,6 +8,7 @@ import {
   Badge,
   InlineStack,
   InlineGrid,
+  Button,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -27,6 +28,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export default function MarketsOverview() {
   const { markets, locales } = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
 
   return (
     <Page backAction={{ content: "Dashboard", url: "/app" }} title="Markets">
@@ -80,10 +82,14 @@ export default function MarketsOverview() {
                     </BlockStack>
                   )}
 
-                  <Text as="p" variant="bodySm">
-                    To create market-specific translations, select this market in
-                    the resource translation editor.
-                  </Text>
+                  <Button
+                    size="slim"
+                    onClick={() =>
+                      navigate(`/app/markets/${market.id.split("/").pop()}`)
+                    }
+                  >
+                    View details
+                  </Button>
                 </BlockStack>
               </Card>
             );

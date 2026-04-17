@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useMemo } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { useLoaderData, useActionData, useSubmit, useNavigation, useRevalidator } from "@remix-run/react";
+import { useJobProgress } from "../hooks/useJobProgress";
 import {
   Page,
   Card,
@@ -30,7 +31,7 @@ import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
 
-  const [locales, markets, jobs, providerConfigs] = await Promise.all([
+  const [locales, markets, jobsResult, providerConfigs] = await Promise.all([
     fetchShopLocales(admin),
     fetchMarkets(admin),
     getJobsForShop(session.shop),
@@ -42,7 +43,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return {
     locales,
     markets,
-    jobs,
+    jobs: jobsResult.jobs,
     hasProviders: providerConfigs.length > 0,
     providers: providerConfigs.map((p) => ({
       provider: p.provider,
@@ -123,18 +124,20 @@ export default function AutoTranslate() {
   const isSubmitting = navigation.state === "submitting";
   const primaryLocale = locales.find((l) => l.primary);
   const localeOptions = formatLocaleOptions(locales);
-  const hasRunningJobs = jobs.some(
-    (j) => j.status === "running" || j.status === "pending",
+
+  // Track running jobs and stream progress via SSE
+  const runningJobIds = useMemo(
+    () =>
+      jobs
+        .filter((j) => j.status === "running" || j.status === "pending")
+        .map((j) => j.id),
+    [jobs],
   );
 
-  // Poll for running jobs
-  useEffect(() => {
-    if (!hasRunningJobs) return;
-    const interval = setInterval(() => {
-      revalidator.revalidate();
-    }, 3000);
-    return () => clearInterval(interval);
-  }, [hasRunningJobs, revalidator]);
+  const { progressMap } = useJobProgress(runningJobIds, {
+    onComplete: () => revalidator.revalidate(),
+    onError: () => revalidator.revalidate(),
+  });
 
   const resourceTypeOptions = Object.entries(RESOURCE_TYPES).map(
     ([key, config]) => ({
@@ -149,6 +152,17 @@ export default function AutoTranslate() {
       .filter((m) => m.enabled)
       .map((m) => ({ label: m.name, value: m.id })),
   ];
+
+  // Filter locale options to market-specific locales when a market is selected
+  const selectedMarket = marketId
+    ? markets.find((m) => m.id === marketId)
+    : null;
+  const selectedMarketLocales = selectedMarket?.webPresence?.rootUrls.map(
+    (r) => r.locale,
+  );
+  const filteredLocaleOptions = selectedMarketLocales
+    ? localeOptions.filter((opt) => selectedMarketLocales.includes(opt.value))
+    : localeOptions;
 
   const handleSubmit = () => {
     const formData = new FormData();
@@ -218,7 +232,7 @@ export default function AutoTranslate() {
               label="Target language"
               options={[
                 { label: "Select language...", value: "" },
-                ...localeOptions,
+                ...filteredLocaleOptions,
               ]}
               value={targetLocale}
               onChange={setTargetLocale}
@@ -262,11 +276,17 @@ export default function AutoTranslate() {
                 ]}
               >
                 {jobs.map((job, index) => {
+                  // Use real-time SSE data if available, otherwise loader data
+                  const live = progressMap[job.id];
+                  const completedItems = live?.completedItems ?? job.completedItems;
+                  const totalItems = live?.totalItems ?? job.totalItems;
+                  const failedItems = live?.failedItems ?? job.failedItems;
+                  const status = live?.status ?? job.status;
                   const progress =
-                    job.totalItems > 0
+                    totalItems > 0
                       ? Math.round(
-                          ((job.completedItems + job.failedItems) /
-                            job.totalItems) *
+                          ((completedItems + failedItems) /
+                            totalItems) *
                             100,
                         )
                       : 0;
@@ -292,16 +312,16 @@ export default function AutoTranslate() {
                       <IndexTable.Cell>
                         <Badge
                           tone={
-                            job.status === "completed"
+                            status === "completed"
                               ? "success"
-                              : job.status === "failed"
+                              : status === "failed"
                                 ? "critical"
-                                : job.status === "running"
+                                : status === "running"
                                   ? "attention"
                                   : undefined
                           }
                         >
-                          {job.status}
+                          {status}
                         </Badge>
                       </IndexTable.Cell>
                       <IndexTable.Cell>
@@ -310,16 +330,16 @@ export default function AutoTranslate() {
                             <ProgressBar
                               progress={progress}
                               tone={
-                                job.status === "failed"
+                                status === "failed"
                                   ? "critical"
                                   : "primary"
                               }
                               size="small"
                             />
                             <Text as="span" variant="bodySm" tone="subdued">
-                              {job.completedItems}/{job.totalItems}
-                              {job.failedItems > 0 &&
-                                ` (${job.failedItems} failed)`}
+                              {completedItems}/{totalItems}
+                              {failedItems > 0 &&
+                                ` (${failedItems} failed)`}
                             </Text>
                           </BlockStack>
                         </div>

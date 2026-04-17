@@ -27,6 +27,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
   const url = new URL(request.url);
   const after = url.searchParams.get("after") || undefined;
+  const before = url.searchParams.get("before") || undefined;
   const locale = url.searchParams.get("locale") || null;
 
   const resourceType = getResourceTypeFromSlug(params.type!);
@@ -38,7 +39,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     fetchTranslatableResources(admin, {
       resourceType,
       first: 25,
-      after,
+      after: before ? null : (after ?? null),
+      before: before ?? null,
     }),
     fetchShopLocales(admin),
   ]);

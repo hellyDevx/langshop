@@ -1,10 +1,16 @@
-import { TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/translatableResources";
+import {
+  TRANSLATABLE_RESOURCES_QUERY,
+  TRANSLATABLE_RESOURCES_BACKWARD_QUERY,
+} from "../graphql/queries/translatableResources";
 import {
   RESOURCE_TRANSLATIONS_QUERY,
   RESOURCE_TRANSLATIONS_WITH_MARKET_QUERY,
 } from "../graphql/queries/translatableResource";
 import { TRANSLATABLE_RESOURCES_WITH_TRANSLATIONS_QUERY } from "../graphql/queries/translatableResourcesWithTranslations";
-import { NESTED_TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/nestedTranslatableResources";
+import {
+  NESTED_TRANSLATABLE_RESOURCES_QUERY,
+  NESTED_TRANSLATABLE_RESOURCES_WITH_MARKET_QUERY,
+} from "../graphql/queries/nestedTranslatableResources";
 import { RESOURCE_CATEGORIES } from "../utils/resource-type-map";
 import prisma from "../db.server";
 import type {
@@ -22,12 +28,26 @@ export async function fetchTranslatableResources(
     resourceType,
     first = 25,
     after = null,
+    before = null,
   }: {
     resourceType: string;
     first?: number;
     after?: string | null;
+    before?: string | null;
   },
 ): Promise<{ nodes: TranslatableResource[]; pageInfo: PageInfo }> {
+  // Use backward query when navigating to a previous page
+  if (before) {
+    const response = await admin.graphql(TRANSLATABLE_RESOURCES_BACKWARD_QUERY, {
+      variables: { resourceType, last: first, before },
+    });
+    const { data } = await response.json();
+    return {
+      nodes: data.translatableResources.nodes,
+      pageInfo: data.translatableResources.pageInfo,
+    };
+  }
+
   const response = await admin.graphql(TRANSLATABLE_RESOURCES_QUERY, {
     variables: { resourceType, first, after },
   });
@@ -64,11 +84,24 @@ export async function fetchTranslatableResource(
 
 export async function fetchTranslatableResourceWithNested(
   admin: AdminClient,
-  { resourceId, locale }: { resourceId: string; locale: string },
+  {
+    resourceId,
+    locale,
+    marketId = null,
+  }: {
+    resourceId: string;
+    locale: string;
+    marketId?: string | null;
+  },
 ): Promise<TranslatableResourceWithNested> {
-  const response = await admin.graphql(NESTED_TRANSLATABLE_RESOURCES_QUERY, {
-    variables: { resourceId, locale },
-  });
+  const query = marketId
+    ? NESTED_TRANSLATABLE_RESOURCES_WITH_MARKET_QUERY
+    : NESTED_TRANSLATABLE_RESOURCES_QUERY;
+
+  const variables: Record<string, string> = { resourceId, locale };
+  if (marketId) variables.marketId = marketId;
+
+  const response = await admin.graphql(query, { variables });
   const { data } = await response.json();
   return data.translatableResource;
 }

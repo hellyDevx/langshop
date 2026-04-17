@@ -35,14 +35,39 @@ const PRODUCTS_WITH_IMAGES_QUERY = `#graphql
   }
 `;
 
+const PRODUCTS_WITH_IMAGES_BACKWARD_QUERY = `#graphql
+  query ProductsWithImagesBackward($last: Int!, $before: String) {
+    products(last: $last, before: $before) {
+      nodes {
+        id
+        title
+        featuredImage {
+          url
+          altText
+        }
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        startCursor
+        endCursor
+      }
+    }
+  }
+`;
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
   const url = new URL(request.url);
   const after = url.searchParams.get("after") || undefined;
+  const before = url.searchParams.get("before") || undefined;
 
-  const response = await admin.graphql(PRODUCTS_WITH_IMAGES_QUERY, {
-    variables: { first: 25, after },
-  });
+  const query = before ? PRODUCTS_WITH_IMAGES_BACKWARD_QUERY : PRODUCTS_WITH_IMAGES_QUERY;
+  const variables = before
+    ? { last: 25, before }
+    : { first: 25, after };
+
+  const response = await admin.graphql(query, { variables });
   const { data } = await response.json();
 
   return {

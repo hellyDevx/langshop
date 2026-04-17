@@ -1,10 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import {
   useLoaderData,
-  useActionData,
-  useSubmit,
-  useNavigation,
+  useFetcher,
   useSearchParams,
 } from "@remix-run/react";
 import {
@@ -37,6 +35,7 @@ import {
   getResourceConfig,
 } from "../utils/resource-type-map";
 import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
+import { MarketSelector } from "../components/MarketSelector";
 import type { TranslationInput } from "../types/translation";
 
 // Map slugs to Shopify GID resource names
@@ -109,6 +108,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         resource = await fetchTranslatableResourceWithNested(admin, {
           resourceId,
           locale: selectedLocale,
+          marketId,
         });
         nestedResources =
           resource?.nestedTranslatableResources?.nodes || [];
@@ -235,22 +235,15 @@ export default function TranslationEditor() {
     selectedMarketId,
   } = useLoaderData<typeof loader>();
 
-  const actionData = useActionData<typeof action>() as
-    | { success?: boolean; error?: string }
-    | undefined;
-  const submit = useSubmit();
-  const navigation = useNavigation();
+  const fetcher = useFetcher<{ success?: boolean; error?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
+  const [optimisticSaved, setOptimisticSaved] = useState(false);
+  const lastSavedRef = useRef<Record<string, string>>({});
 
-  const isSubmitting = navigation.state === "submitting";
+  const isSubmitting = fetcher.state === "submitting";
+  const actionData = fetcher.data;
   const config = RESOURCE_TYPES[resourceType];
   const localeOptions = formatLocaleOptions(locales);
-  const marketOptions = [
-    { label: "Global (all markets)", value: "" },
-    ...markets
-      .filter((m) => m.enabled)
-      .map((m) => ({ label: m.name, value: m.id })),
-  ];
 
   // Build translation map from existing translations
   const translationMap: Record<string, { key: string; value: string; outdated?: boolean }> = {};
@@ -339,7 +332,10 @@ export default function TranslationEditor() {
       });
     });
 
-    submit(formData, { method: "POST" });
+    // Optimistic: show saved immediately
+    setOptimisticSaved(true);
+    lastSavedRef.current = { ...fieldValues };
+    fetcher.submit(formData, { method: "POST" });
   };
 
   const resourceName = resource
@@ -356,9 +352,9 @@ export default function TranslationEditor() {
     >
       <TitleBar title={`Translate: ${resourceName}`} />
       <BlockStack gap="400">
-        {actionData?.success && (
-          <Banner tone="success" onDismiss={() => {}}>
-            Translations saved successfully!
+        {(actionData?.success || optimisticSaved) && !actionData?.error && (
+          <Banner tone="success" onDismiss={() => setOptimisticSaved(false)}>
+            {isSubmitting ? "Saving translations..." : "Translations saved successfully!"}
           </Banner>
         )}
         {actionData?.error && (
@@ -378,11 +374,11 @@ export default function TranslationEditor() {
               />
             </div>
             <div style={{ width: "250px" }}>
-              <Select
-                label="Market scope"
-                options={marketOptions}
-                value={selectedMarketId || ""}
+              <MarketSelector
+                markets={markets}
+                selectedMarketId={selectedMarketId}
                 onChange={handleMarketChange}
+                locale={selectedLocale}
               />
             </div>
           </InlineStack>

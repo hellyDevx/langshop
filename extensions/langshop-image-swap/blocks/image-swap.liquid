@@ -16,7 +16,9 @@
   window.__langshop = {
     locale: {{ request.locale.iso_code | json }},
     shopLocale: {{ shop.locale | json }},
-    shop: {{ shop.permanent_domain | json }}
+    shop: {{ shop.permanent_domain | json }},
+    marketId: {{ localization.market.id | json }},
+    marketHandle: {{ localization.market.handle | json }}
   };
 </script>
 <script src="{{ 'image-swap.js' | asset_url }}" defer></script>
