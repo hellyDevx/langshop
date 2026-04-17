@@ -4,6 +4,19 @@ import type {
   Language,
 } from "../../types/provider";
 
+export class ProviderTransientError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ProviderTransientError";
+    this.status = status;
+  }
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
 export function createProvider(
   providerType: string,
   config: ProviderConfig,
@@ -48,18 +61,20 @@ function createGoogleProvider(config: ProviderConfig): TranslationProvider {
         });
 
         if (!response.ok) {
-          const error = await response.json();
-          throw new Error(
-            `Google Translate error: ${error.error?.message || response.statusText}`,
-          );
+          const errorBody = (await response.json().catch(() => null)) as
+            | { error?: { message?: string } }
+            | null;
+          const message = `Google Translate error: ${errorBody?.error?.message || response.statusText}`;
+          if (isTransientStatus(response.status)) {
+            throw new ProviderTransientError(message, response.status);
+          }
+          throw new Error(message);
         }
 
-        const data = await response.json();
-        results.push(
-          ...data.translations.map(
-            (t: { translatedText: string }) => t.translatedText,
-          ),
-        );
+        const data = (await response.json()) as {
+          translations: Array<{ translatedText: string }>;
+        };
+        results.push(...data.translations.map((t) => t.translatedText));
       }
 
       return results;
@@ -123,14 +138,18 @@ function createDeepLProvider(config: ProviderConfig): TranslationProvider {
         });
 
         if (!response.ok) {
-          const error = await response.text();
-          throw new Error(`DeepL error: ${error}`);
+          const errorBody = await response.text();
+          const message = `DeepL error: ${errorBody || response.statusText}`;
+          if (isTransientStatus(response.status)) {
+            throw new ProviderTransientError(message, response.status);
+          }
+          throw new Error(message);
         }
 
-        const data = await response.json();
-        results.push(
-          ...data.translations.map((t: { text: string }) => t.text),
-        );
+        const data = (await response.json()) as {
+          translations: Array<{ text: string }>;
+        };
+        results.push(...data.translations.map((t) => t.text));
       }
 
       return results;

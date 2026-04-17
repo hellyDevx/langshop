@@ -1,18 +1,24 @@
 import { PassThrough } from "stream";
 import { renderToPipeableStream } from "react-dom/server";
 import { RemixServer } from "@remix-run/react";
-import { createReadableStreamFromReadable } from "@remix-run/node";
+import {
+  createReadableStreamFromReadable,
+  type EntryContext,
+} from "@remix-run/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { startJobPicker } from "./services/job-scheduler.server";
+
+startJobPicker();
 
 export const streamTimeout = 5000;
 
 export default async function handleRequest(
-  request,
-  responseStatusCode,
-  responseHeaders,
-  remixContext,
-) {
+  request: Request,
+  responseStatusCode: number,
+  responseHeaders: Headers,
+  remixContext: EntryContext,
+): Promise<Response> {
   addDocumentResponseHeaders(request, responseHeaders);
   const userAgent = request.headers.get("user-agent");
   const callbackName = isbot(userAgent ?? "") ? "onAllReady" : "onShellReady";
@@ -34,10 +40,10 @@ export default async function handleRequest(
           );
           pipe(body);
         },
-        onShellError(error) {
+        onShellError(error: unknown) {
           reject(error);
         },
-        onError(error) {
+        onError(error: unknown) {
           responseStatusCode = 500;
           console.error(error);
         },

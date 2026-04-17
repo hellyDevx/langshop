@@ -1,12 +1,50 @@
+import type { TranslationJob, TranslationProviderConfig } from "@prisma/client";
 import prisma from "../db.server";
-import { createProvider } from "./providers/provider-interface.server";
+import { unauthenticated } from "../shopify.server";
+import {
+  createProvider,
+  ProviderTransientError,
+} from "./providers/provider-interface.server";
+import { upsertContentDigest } from "./content-sync.server";
+import { hashContent } from "../utils/content-hash";
 import { TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/translatableResources";
-import { RESOURCE_TRANSLATIONS_QUERY } from "../graphql/queries/translatableResource";
 import { TRANSLATIONS_REGISTER_MUTATION } from "../graphql/mutations/translationsRegister";
 import { batchFetchTranslatableResources } from "../utils/graphql-batcher";
-import type { AdminClient, TranslatableContent } from "../types/shopify";
+import type { AdminClient } from "../types/shopify";
 import type { TranslationInput } from "../types/translation";
 import type { TranslationProvider, ProviderConfig } from "../types/provider";
+
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 30_000;
+const RETRY_CAP_MS = 10 * 60_000;
+
+interface TranslatableResourcesResponse {
+  data: {
+    translatableResources: {
+      nodes: Array<{ resourceId: string }>;
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    };
+  };
+}
+
+interface TranslationsRegisterResponse {
+  data: {
+    translationsRegister: {
+      translations: Array<{ key: string; value: string; locale: string }>;
+      userErrors: Array<{ field: string[] | null; message: string }>;
+    };
+  };
+}
+
+interface FreshResource {
+  resourceId: string;
+  translatableContent: Array<{
+    key: string;
+    value: string;
+    digest: string;
+    locale: string;
+  }>;
+}
 
 export async function createTranslationJob(
   shop: string,
@@ -68,23 +106,123 @@ export async function getJobsForShop(
   };
 }
 
+export async function recoverStrandedJobs(
+  staleAfterMs: number,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - staleAfterMs);
+  const result = await prisma.translationJob.updateMany({
+    where: {
+      status: "running",
+      startedAt: { lt: cutoff },
+    },
+    data: {
+      status: "pending",
+      startedAt: null,
+      scheduledAt: null,
+    },
+  });
+  return result.count;
+}
+
+export async function claimNextJob(): Promise<{
+  job: TranslationJob;
+  providerConfig: TranslationProviderConfig;
+} | null> {
+  const now = new Date();
+  const candidate = await prisma.translationJob.findFirst({
+    where: {
+      status: "pending",
+      OR: [{ scheduledAt: null }, { scheduledAt: { lte: now } }],
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  if (!candidate) return null;
+
+  const providerConfig = await prisma.translationProviderConfig.findUnique({
+    where: {
+      shop_provider: { shop: candidate.shop, provider: candidate.provider },
+    },
+  });
+  if (!providerConfig || !providerConfig.isActive) {
+    await prisma.translationJob.update({
+      where: { id: candidate.id },
+      data: {
+        status: "failed",
+        errorMessage: `Provider ${candidate.provider} is not configured for this shop.`,
+        completedAt: new Date(),
+      },
+    });
+    return null;
+  }
+
+  const claimed = await prisma.translationJob.update({
+    where: { id: candidate.id },
+    data: { status: "running", startedAt: new Date() },
+  });
+
+  return { job: claimed, providerConfig };
+}
+
+export async function scheduleRetry(
+  jobId: string,
+  attemptCount: number,
+  errorMessage: string,
+): Promise<void> {
+  if (attemptCount >= MAX_RETRIES) {
+    await prisma.translationJob.update({
+      where: { id: jobId },
+      data: {
+        status: "failed",
+        errorMessage,
+        retryCount: attemptCount,
+        completedAt: new Date(),
+      },
+    });
+    await prisma.translationAlert.create({
+      data: {
+        shop: (
+          await prisma.translationJob.findUniqueOrThrow({
+            where: { id: jobId },
+            select: { shop: true },
+          })
+        ).shop,
+        type: "failure",
+        severity: "critical",
+        message: `Translation job failed after ${attemptCount} attempts: ${errorMessage}`,
+        jobId,
+      },
+    });
+    return;
+  }
+
+  const backoff = Math.min(
+    RETRY_BASE_MS * Math.pow(2, attemptCount),
+    RETRY_CAP_MS,
+  );
+  const scheduledAt = new Date(Date.now() + backoff);
+  await prisma.translationJob.update({
+    where: { id: jobId },
+    data: {
+      status: "pending",
+      retryCount: attemptCount,
+      scheduledAt,
+      startedAt: null,
+      errorMessage,
+    },
+  });
+}
+
 export async function runTranslationJob(
-  admin: AdminClient,
   jobId: string,
   providerConfig: ProviderConfig,
 ) {
   const job = await prisma.translationJob.findUnique({
     where: { id: jobId },
   });
-
   if (!job) throw new Error("Job not found");
 
+  const { admin } = await unauthenticated.admin(job.shop);
   const provider = createProvider(job.provider, providerConfig);
-
-  await prisma.translationJob.update({
-    where: { id: jobId },
-    data: { status: "running" },
-  });
 
   let cursor: string | null = null;
   let totalProcessed = 0;
@@ -92,7 +230,6 @@ export async function runTranslationJob(
 
   try {
     while (true) {
-      // Fetch a page of resources
       const gqlResponse = await admin.graphql(TRANSLATABLE_RESOURCES_QUERY, {
         variables: {
           resourceType: job.resourceType,
@@ -100,23 +237,20 @@ export async function runTranslationJob(
           after: cursor,
         },
       });
-      const gqlJson = await gqlResponse.json();
-      const { nodes, pageInfo } = gqlJson.data.translatableResources as {
-        nodes: Array<{ resourceId: string }>;
-        pageInfo: { hasNextPage: boolean; endCursor?: string };
-      };
+      const gqlJson = (await gqlResponse.json()) as TranslatableResourcesResponse;
+      const { nodes, pageInfo } = gqlJson.data.translatableResources;
 
       if (nodes.length === 0) break;
 
-      // Update total count on first page
       if (!cursor) {
         await prisma.translationJob.update({
           where: { id: jobId },
-          data: { totalItems: nodes.length + (pageInfo.hasNextPage ? 10 : 0) },
+          data: {
+            totalItems: nodes.length + (pageInfo.hasNextPage ? 10 : 0),
+          },
         });
       }
 
-      // Batch-fetch fresh digests for all resources on this page
       const resourceIds = nodes.map((n) => n.resourceId);
       const batchedResources = await batchFetchTranslatableResources(
         admin,
@@ -124,7 +258,6 @@ export async function runTranslationJob(
         job.targetLocale,
       );
 
-      // Process each resource using pre-fetched data
       for (const resource of nodes) {
         try {
           const freshResource = batchedResources[resource.resourceId];
@@ -134,6 +267,7 @@ export async function runTranslationJob(
             admin,
             provider,
             freshResource,
+            job.shop,
             job.sourceLocale,
             job.targetLocale,
             job.marketId,
@@ -141,26 +275,30 @@ export async function runTranslationJob(
           );
           totalProcessed++;
         } catch (error) {
+          if (error instanceof ProviderTransientError) {
+            // Roll back progress and retry the whole job later.
+            throw error;
+          }
           totalFailed++;
-          const message = error instanceof Error ? error.message : String(error);
+          const message =
+            error instanceof Error ? error.message : String(error);
           console.error(
             `Failed to translate ${resource.resourceId}:`,
             message,
           );
         }
 
-        // Update progress
         await prisma.translationJob.update({
           where: { id: jobId },
           data: {
             completedItems: totalProcessed,
             failedItems: totalFailed,
-            totalItems: totalProcessed + totalFailed + (pageInfo.hasNextPage ? 10 : 0),
+            totalItems:
+              totalProcessed + totalFailed + (pageInfo.hasNextPage ? 10 : 0),
           },
         });
       }
 
-      // Rate limit delay between pages
       if (pageInfo.hasNextPage) {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
@@ -172,14 +310,22 @@ export async function runTranslationJob(
     await prisma.translationJob.update({
       where: { id: jobId },
       data: {
-        status: totalFailed > 0 && totalProcessed === 0 ? "failed" : "completed",
+        status:
+          totalFailed > 0 && totalProcessed === 0 ? "failed" : "completed",
         completedItems: totalProcessed,
         failedItems: totalFailed,
         totalItems: totalProcessed + totalFailed,
+        completedAt: new Date(),
       },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+
+    if (error instanceof ProviderTransientError) {
+      await scheduleRetry(jobId, job.retryCount + 1, message);
+      return;
+    }
+
     await prisma.translationJob.update({
       where: { id: jobId },
       data: {
@@ -187,6 +333,16 @@ export async function runTranslationJob(
         errorMessage: message,
         completedItems: totalProcessed,
         failedItems: totalFailed,
+        completedAt: new Date(),
+      },
+    });
+    await prisma.translationAlert.create({
+      data: {
+        shop: job.shop,
+        type: "failure",
+        severity: "critical",
+        message: `Translation job failed: ${message}`,
+        jobId,
       },
     });
     throw error;
@@ -196,10 +352,8 @@ export async function runTranslationJob(
 async function translateResourceFromData(
   admin: AdminClient,
   provider: TranslationProvider,
-  freshResource: {
-    resourceId: string;
-    translatableContent: Array<{ key: string; value: string; digest: string; locale: string }>;
-  },
+  freshResource: FreshResource,
+  shop: string,
   sourceLocale: string,
   targetLocale: string,
   marketId: string | null,
@@ -240,12 +394,13 @@ async function translateResourceFromData(
       },
     },
   );
-  const registerData = await registerResponse.json();
+  const registerData =
+    (await registerResponse.json()) as TranslationsRegisterResponse;
 
   if (registerData.data.translationsRegister.userErrors.length > 0) {
     throw new Error(
       registerData.data.translationsRegister.userErrors
-        .map((e: { message: string }) => e.message)
+        .map((e) => e.message)
         .join(", "),
     );
   }
@@ -260,82 +415,13 @@ async function translateResourceFromData(
       status: "completed",
     })),
   });
-}
 
-async function translateResource(
-  admin: AdminClient,
-  provider: TranslationProvider,
-  resource: { resourceId: string },
-  sourceLocale: string,
-  targetLocale: string,
-  marketId: string | null,
-  jobId: string,
-) {
-  // Get fresh digests
-  const response = await admin.graphql(RESOURCE_TRANSLATIONS_QUERY, {
-    variables: { resourceId: resource.resourceId, locale: targetLocale },
-  });
-  const { data } = await response.json();
-  const freshResource = data.translatableResource;
-
-  // Filter to text content that has values
-  const translatableFields = freshResource.translatableContent.filter(
-    (c: TranslatableContent) => c.value && c.value.trim() !== "",
-  );
-
-  if (translatableFields.length === 0) return;
-
-  // Batch translate all fields
-  const textsToTranslate = translatableFields.map((f: TranslatableContent) => f.value);
-  const translatedTexts = await provider.translate(
-    textsToTranslate,
-    sourceLocale,
-    targetLocale,
-  );
-
-  // Build translation inputs
-  const translations: TranslationInput[] = translatableFields.map(
-    (field: TranslatableContent, index: number) => {
-      const input: TranslationInput = {
-        key: field.key,
-        value: translatedTexts[index],
-        locale: targetLocale,
-        translatableContentDigest: field.digest,
-      };
-      if (marketId) input.marketId = marketId;
-      return input;
-    },
-  );
-
-  // Register translations
-  const registerResponse = await admin.graphql(
-    TRANSLATIONS_REGISTER_MUTATION,
-    {
-      variables: {
-        resourceId: resource.resourceId,
-        translations,
-      },
-    },
-  );
-  const registerData = await registerResponse.json();
-
-  if (registerData.data.translationsRegister.userErrors.length > 0) {
-    throw new Error(
-      registerData.data.translationsRegister.userErrors
-        .map((e: { message: string }) => e.message)
-        .join(", "),
+  for (const field of translatableFields) {
+    await upsertContentDigest(
+      shop,
+      freshResource.resourceId,
+      field.key,
+      hashContent(field.value),
     );
   }
-
-  // Record entries
-  await prisma.translationJobEntry.createMany({
-    data: translatableFields.map((field: TranslatableContent, index: number) => ({
-      jobId,
-      resourceId: resource.resourceId,
-      key: field.key,
-      sourceValue: field.value,
-      translatedValue: translatedTexts[index],
-      status: "completed",
-    })),
-  });
 }

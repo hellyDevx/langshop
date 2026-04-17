@@ -46,6 +46,7 @@ export interface ResourceTypeConfig {
   label: string;
   slug: string;
   hasNestedMetafields?: boolean;
+  gidType?: string;
 }
 
 // Resource category (groups of resource types)

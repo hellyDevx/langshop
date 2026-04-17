@@ -21,7 +21,6 @@ import { authenticate } from "../shopify.server";
 import { fetchShopLocales, fetchMarkets } from "../services/markets.server";
 import {
   createTranslationJob,
-  runTranslationJob,
   getJobsForShop,
 } from "../services/auto-translate.server";
 import prisma from "../db.server";
@@ -53,7 +52,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
 
@@ -88,14 +87,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         marketId,
       });
 
-      // Run the job (non-blocking would be ideal, but for now we run inline)
-      runTranslationJob(admin, job.id, {
-        apiKey: providerConfig.apiKey,
-        projectId: providerConfig.projectId ?? undefined,
-      }).catch((err) => {
-        console.error("Translation job failed:", err);
-      });
-
+      // Job is queued as `pending`. The scheduler picks it up within one tick
+      // (~15s) using an offline admin client, so the action returns immediately
+      // and the work survives process restarts.
       return json({ success: true, jobId: job.id });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

@@ -1,6 +1,9 @@
 import type { ShopLocale } from "../types/shopify";
 
-const LOCALE_DISPLAY_NAMES: Record<string, string> = {
+// Curated overrides — preserved so existing UI labels don't churn when
+// Intl.DisplayNames returns a slightly different name (e.g. "Chinese, Simplified"
+// vs "Chinese (Simplified)") across Node/ICU versions.
+const LOCALE_OVERRIDES: Record<string, string> = {
   en: "English",
   fr: "French",
   es: "Spanish",
@@ -35,8 +38,32 @@ const LOCALE_DISPLAY_NAMES: Record<string, string> = {
   ms: "Malay",
 };
 
+let intlDisplayNames: Intl.DisplayNames | null = null;
+function getIntlDisplayNames(): Intl.DisplayNames | null {
+  if (intlDisplayNames) return intlDisplayNames;
+  try {
+    intlDisplayNames = new Intl.DisplayNames(["en"], {
+      type: "language",
+      fallback: "code",
+    });
+    return intlDisplayNames;
+  } catch {
+    return null;
+  }
+}
+
 export function getLocaleDisplayName(locale: string): string {
-  return LOCALE_DISPLAY_NAMES[locale] || locale;
+  if (!locale) return locale;
+  const override = LOCALE_OVERRIDES[locale];
+  if (override) return override;
+  const dn = getIntlDisplayNames();
+  if (!dn) return locale;
+  try {
+    const name = dn.of(locale);
+    return name && name !== locale ? name : locale;
+  } catch {
+    return locale;
+  }
 }
 
 export function formatLocaleOptions(

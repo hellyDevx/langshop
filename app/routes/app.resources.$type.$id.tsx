@@ -33,37 +33,53 @@ import {
   getResourceTypeFromSlug,
   getResourceDisplayName,
   getResourceConfig,
+  getGidTypeFromSlug,
 } from "../utils/resource-type-map";
 import { formatLocaleOptions, getLocaleDisplayName } from "../utils/locale-utils";
 import { MarketSelector } from "../components/MarketSelector";
 import type { TranslationInput } from "../types/translation";
 
-// Map slugs to Shopify GID resource names
-const SLUG_TO_GID_TYPE: Record<string, string> = {
-  products: "Product",
-  collections: "Collection",
-  pages: "OnlineStorePage",
-  articles: "OnlineStoreArticle",
-  blogs: "OnlineStoreBlog",
-  metaobjects: "Metaobject",
-  "shop-policies": "ShopPolicy",
-  navigation: "Menu",
-  filters: "Filter",
-  "dynamic-text": "OnlineStoreTheme",
-  "storefront-elements": "OnlineStoreThemeAppEmbed",
-  "store-components": "OnlineStoreThemeSettingsDataSection",
-  "theme-locale-content": "OnlineStoreThemeLocaleContent",
-  "theme-json-templates": "OnlineStoreThemeJsonTemplate",
-  "email-templates": "EmailTemplate",
-  "packing-slip": "PackingSlipTemplate",
-  "payment-gateways": "PaymentGateway",
-  "delivery-methods": "DeliveryMethodDefinition",
-};
-
 function buildResourceGid(slug: string, numericId: string): string | null {
-  const gidType = SLUG_TO_GID_TYPE[slug];
+  const gidType = getGidTypeFromSlug(slug);
   if (!gidType) return null;
   return `gid://shopify/${gidType}/${numericId}`;
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  handle: "URL handle",
+  meta_title: "SEO title",
+  meta_description: "SEO description",
+  title: "Title",
+  body_html: "Body",
+  body: "Body",
+  summary: "Summary",
+  alt: "Image alt text",
+  filename: "Filename",
+};
+
+const FIELD_HELP: Record<string, string> = {
+  handle:
+    "Lowercase letters, numbers, and hyphens only. Changing this changes the translated URL.",
+  meta_title: "Recommended length: under 70 characters.",
+  meta_description: "Recommended length: under 320 characters.",
+};
+
+function fieldDisplayLabel(key: string): string {
+  return FIELD_LABELS[key] ?? key;
+}
+
+function fieldValidationError(key: string, value: string): string | undefined {
+  if (!value) return undefined;
+  if (key === "handle" && !/^[a-z0-9-]+$/.test(value)) {
+    return "URL handle must contain only lowercase letters, numbers, and hyphens.";
+  }
+  if (key === "meta_title" && value.length > 70) {
+    return `${value.length}/70 characters — over recommended length.`;
+  }
+  if (key === "meta_description" && value.length > 320) {
+    return `${value.length}/320 characters — over recommended length.`;
+  }
+  return undefined;
 }
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
@@ -409,7 +425,7 @@ export default function TranslationEditor() {
                       <Box key={field.key}>
                         <BlockStack gap="100">
                           <Text as="span" variant="bodySm" tone="subdued">
-                            {field.key}
+                            {fieldDisplayLabel(field.key)}
                           </Text>
                           <Box
                             padding="300"
@@ -459,7 +475,7 @@ export default function TranslationEditor() {
                                 variant="bodySm"
                                 tone="subdued"
                               >
-                                {field.key}
+                                {fieldDisplayLabel(field.key)}
                               </Text>
                               {existing?.outdated && (
                                 <Badge tone="warning">Outdated</Badge>
@@ -478,6 +494,11 @@ export default function TranslationEditor() {
                               multiline={isMultiline ? 4 : false}
                               autoComplete="off"
                               placeholder={`Enter ${selectedLocale} translation...`}
+                              helpText={FIELD_HELP[field.key]}
+                              error={fieldValidationError(
+                                field.key,
+                                fieldValues[field.key] || "",
+                              )}
                             />
                           </BlockStack>
                         </Box>
@@ -544,7 +565,7 @@ export default function TranslationEditor() {
                                         variant="bodySm"
                                         tone="subdued"
                                       >
-                                        {field.key} (original)
+                                        {fieldDisplayLabel(field.key)} (original)
                                       </Text>
                                       <Text as="p" variant="bodyMd" breakWord>
                                         {field.value.length > 200
@@ -561,7 +582,7 @@ export default function TranslationEditor() {
                                           variant="bodySm"
                                           tone="subdued"
                                         >
-                                          {field.key} (translation)
+                                          {fieldDisplayLabel(field.key)} (translation)
                                         </Text>
                                         {existing?.outdated && (
                                           <Badge tone="warning">
@@ -587,6 +608,11 @@ export default function TranslationEditor() {
                                         }
                                         autoComplete="off"
                                         placeholder={`${selectedLocale} translation...`}
+                                        helpText={FIELD_HELP[field.key]}
+                                        error={fieldValidationError(
+                                          field.key,
+                                          nrVals[field.key] || "",
+                                        )}
                                       />
                                     </BlockStack>
                                   </div>
