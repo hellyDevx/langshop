@@ -34,20 +34,25 @@ model Session {
 }
 
 model TranslationJob {
-  id             String   @id @default(uuid())
-  shop           String
-  status         String   @default("pending")
-  provider       String
-  resourceType   String
-  sourceLocale   String
-  targetLocale   String
-  marketId       String?
-  totalItems     Int      @default(0)
-  completedItems Int      @default(0)
-  failedItems    Int      @default(0)
-  errorMessage   String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  id              String    @id @default(uuid())
+  shop            String
+  status          String    @default("pending")
+  provider        String
+  resourceType    String
+  sourceLocale    String
+  targetLocale    String
+  marketId        String?
+  totalItems      Int       @default(0)
+  completedItems  Int       @default(0)
+  failedItems     Int       @default(0)
+  errorMessage    String?
+  retryCount      Int       @default(0)
+  scheduledAt     DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  glossaryApplied Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   entries TranslationJobEntry[]
 
@@ -56,15 +61,16 @@ model TranslationJob {
 }
 
 model TranslationJobEntry {
-  id              String   @id @default(uuid())
-  jobId           String
-  resourceId      String
-  key             String
-  sourceValue     String
-  translatedValue String?
-  status          String   @default("pending")
-  errorMessage    String?
-  createdAt       DateTime @default(now())
+  id               String   @id @default(uuid())
+  jobId            String
+  resourceId       String
+  key              String
+  sourceValue      String
+  translatedValue  String?
+  status           String   @default("pending")
+  errorMessage     String?
+  providerResponse String?
+  createdAt        DateTime @default(now())
 
   job TranslationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
@@ -72,14 +78,18 @@ model TranslationJobEntry {
 }
 
 model TranslationProviderConfig {
-  id        String   @id @default(uuid())
-  shop      String
-  provider  String
-  apiKey    String
-  projectId String?
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id             String    @id @default(uuid())
+  shop           String
+  provider       String
+  apiKey         String
+  projectId      String?
+  isActive       Boolean   @default(true)
+  displayName    String?
+  monthlyQuota   Int?
+  quotaUsed      Int       @default(0)
+  quotaResetDate DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   @@unique([shop, provider])
 }
@@ -107,11 +117,129 @@ model TranslationStats {
   shop            String
   resourceType    String
   locale          String
+  marketId        String   @default("")
   totalSampled    Int      @default(0)
   translatedCount Int      @default(0)
   hasResources    Boolean  @default(false)
   cachedAt        DateTime @default(now())
 
-  @@unique([shop, resourceType, locale])
+  @@unique([shop, resourceType, locale, marketId])
   @@index([shop, locale])
+}
+
+model GlossaryTerm {
+  id             String   @id @default(uuid())
+  shop           String
+  sourceLocale   String
+  targetLocale   String
+  sourceTerm     String
+  targetTerm     String
+  caseSensitive  Boolean  @default(false)
+  neverTranslate Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([shop, sourceLocale, targetLocale, sourceTerm])
+  @@index([shop, sourceLocale])
+}
+
+model BrandVoiceConfig {
+  id           String   @id @default(uuid())
+  shop         String   @unique
+  tone         String
+  style        String
+  instructions String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model TranslationAuditLog {
+  id            String   @id @default(uuid())
+  shop          String
+  resourceId    String
+  resourceType  String
+  locale        String
+  marketId      String?
+  fieldKey      String
+  previousValue String?
+  newValue      String
+  source        String
+  createdAt     DateTime @default(now())
+
+  @@index([shop, resourceId, locale])
+  @@index([shop, createdAt])
+}
+
+model TranslationAlert {
+  id         String   @id @default(uuid())
+  shop       String
+  type       String
+  severity   String
+  message    String
+  resourceId String?
+  locale     String?
+  jobId      String?
+  dismissed  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([shop, dismissed, createdAt])
+}
+
+model UsageTracking {
+  id             String   @id @default(uuid())
+  shop           String
+  provider       String
+  characterCount Int
+  requestCount   Int
+  locale         String
+  date           DateTime
+
+  @@unique([shop, provider, locale, date])
+  @@index([shop, date])
+}
+
+model ContentDigest {
+  id            String   @id @default(uuid())
+  shop          String
+  resourceId    String
+  fieldKey      String
+  contentHash   String
+  lastCheckedAt DateTime
+
+  @@unique([shop, resourceId, fieldKey])
+  @@index([shop, resourceId])
+}
+
+model TranslationSuggestion {
+  id              String    @id @default(uuid())
+  shop            String
+  resourceId      String
+  resourceType    String
+  fieldKey        String
+  locale          String
+  marketId        String?
+  sourceValue     String
+  suggestedValue  String
+  editedValue     String?
+  status          String
+  provider        String
+  rejectionReason String?
+  createdAt       DateTime  @default(now())
+  reviewedAt      DateTime?
+
+  @@index([shop, status])
+  @@index([shop, resourceId, locale])
+  @@unique([shop, resourceId, fieldKey, locale, marketId])
+}
+
+model OnboardingState {
+  id               String    @id @default(uuid())
+  shop             String    @unique
+  step             Int       @default(0)
+  completedSteps   String
+  primaryLocale    String?
+  targetLocales    String?
+  selectedProvider String?
+  completedAt      DateTime?
+  createdAt        DateTime  @default(now())
 }
