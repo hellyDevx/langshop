@@ -1,4 +1,8 @@
-import type { TranslationJob, TranslationProviderConfig } from "@prisma/client";
+import type {
+  GlossaryTerm,
+  TranslationJob,
+  TranslationProviderConfig,
+} from "@prisma/client";
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import {
@@ -6,6 +10,12 @@ import {
   ProviderTransientError,
 } from "./providers/provider-interface.server";
 import { upsertContentDigest } from "./content-sync.server";
+import {
+  applyGlossaryPost,
+  applyGlossaryPre,
+  getGlossaryTermsByLocalePair,
+  type ViolationWarning,
+} from "./glossary.server";
 import { hashContent } from "../utils/content-hash";
 import { TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/translatableResources";
 import { TRANSLATIONS_REGISTER_MUTATION } from "../graphql/mutations/translationsRegister";
@@ -224,6 +234,13 @@ export async function runTranslationJob(
   const { admin } = await unauthenticated.admin(job.shop);
   const provider = createProvider(job.provider, providerConfig);
 
+  const glossaryRules = await getGlossaryTermsByLocalePair(
+    job.shop,
+    job.sourceLocale,
+    job.targetLocale,
+  );
+  let glossaryApplied = false;
+
   let cursor: string | null = null;
   let totalProcessed = 0;
   let totalFailed = 0;
@@ -263,7 +280,7 @@ export async function runTranslationJob(
           const freshResource = batchedResources[resource.resourceId];
           if (!freshResource) throw new Error("Resource not found in batch");
 
-          await translateResourceFromData(
+          const resourceStats = await translateResourceFromData(
             admin,
             provider,
             freshResource,
@@ -272,7 +289,9 @@ export async function runTranslationJob(
             job.targetLocale,
             job.marketId,
             jobId,
+            glossaryRules,
           );
+          if (resourceStats.glossaryMatched) glossaryApplied = true;
           totalProcessed++;
         } catch (error) {
           if (error instanceof ProviderTransientError) {
@@ -316,6 +335,7 @@ export async function runTranslationJob(
         failedItems: totalFailed,
         totalItems: totalProcessed + totalFailed,
         completedAt: new Date(),
+        glossaryApplied,
       },
     });
   } catch (error) {
@@ -349,6 +369,10 @@ export async function runTranslationJob(
   }
 }
 
+interface ResourceTranslationStats {
+  glossaryMatched: boolean;
+}
+
 async function translateResourceFromData(
   admin: AdminClient,
   provider: TranslationProvider,
@@ -358,19 +382,37 @@ async function translateResourceFromData(
   targetLocale: string,
   marketId: string | null,
   jobId: string,
-) {
+  glossaryRules: GlossaryTerm[],
+): Promise<ResourceTranslationStats> {
   const translatableFields = freshResource.translatableContent.filter(
     (c) => c.value && c.value.trim() !== "",
   );
 
-  if (translatableFields.length === 0) return;
+  if (translatableFields.length === 0) {
+    return { glossaryMatched: false };
+  }
 
-  const textsToTranslate = translatableFields.map((f) => f.value);
-  const translatedTexts = await provider.translate(
-    textsToTranslate,
+  let glossaryMatched = false;
+  const preResults = translatableFields.map((f) => {
+    const pre = applyGlossaryPre(f.value, glossaryRules);
+    if (pre.placeholderMap.length > 0) glossaryMatched = true;
+    return pre;
+  });
+
+  const maskedTexts = preResults.map((p) => p.masked);
+  const providerOutputs = await provider.translate(
+    maskedTexts,
     sourceLocale,
     targetLocale,
   );
+
+  const postResults = providerOutputs.map((out, i) =>
+    applyGlossaryPost(out, preResults[i].placeholderMap, glossaryRules),
+  );
+  const translatedTexts = postResults.map((r) => r.restored);
+  if (postResults.some((r) => r.violations.length > 0)) {
+    glossaryMatched = true;
+  }
 
   const translations: TranslationInput[] = translatableFields.map(
     (field, index) => {
@@ -406,14 +448,21 @@ async function translateResourceFromData(
   }
 
   await prisma.translationJobEntry.createMany({
-    data: translatableFields.map((field, index) => ({
-      jobId,
-      resourceId: freshResource.resourceId,
-      key: field.key,
-      sourceValue: field.value,
-      translatedValue: translatedTexts[index],
-      status: "completed",
-    })),
+    data: translatableFields.map((field, index) => {
+      const violations: ViolationWarning[] = postResults[index].violations;
+      return {
+        jobId,
+        resourceId: freshResource.resourceId,
+        key: field.key,
+        sourceValue: field.value,
+        translatedValue: translatedTexts[index],
+        status: "completed",
+        providerResponse:
+          violations.length > 0
+            ? JSON.stringify({ glossaryViolations: violations })
+            : null,
+      };
+    }),
   });
 
   for (const field of translatableFields) {
@@ -424,4 +473,6 @@ async function translateResourceFromData(
       hashContent(field.value),
     );
   }
+
+  return { glossaryMatched };
 }

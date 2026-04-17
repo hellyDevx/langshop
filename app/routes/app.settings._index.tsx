@@ -285,6 +285,24 @@ export default function Settings() {
             )}
           </BlockStack>
         </Card>
+
+        <Card>
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center">
+              <Text as="h2" variant="headingMd">
+                Brand voice
+              </Text>
+              <Badge>AI only</Badge>
+            </InlineStack>
+            <Text as="p" variant="bodyMd" tone="subdued">
+              Set the tone, style, and custom instructions that AI translations
+              follow. Google and DeepL use glossary rules instead.
+            </Text>
+            <InlineStack align="end">
+              <Button url="/app/settings/brand-voice">Configure</Button>
+            </InlineStack>
+          </BlockStack>
+        </Card>
       </BlockStack>
     </Page>
   );

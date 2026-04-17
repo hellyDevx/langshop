@@ -26,6 +26,7 @@ export default function App() {
         <Link to="/app/markets">Markets</Link>
         <Link to="/app/auto-translate">Auto-Translate</Link>
         <Link to="/app/images">Images</Link>
+        <Link to="/app/glossary">Glossary</Link>
         <Link to="/app/settings">Settings</Link>
       </NavMenu>
       <Outlet />

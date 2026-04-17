@@ -3,6 +3,29 @@ import { TRANSLATIONS_REMOVE_MUTATION } from "../graphql/mutations/translationsR
 import type { AdminClient, Translation } from "../types/shopify";
 import type { TranslationInput } from "../types/translation";
 
+interface UserError {
+  field: string[] | null;
+  message: string;
+}
+
+interface TranslationsRegisterResponse {
+  data: {
+    translationsRegister: {
+      translations: Translation[];
+      userErrors: UserError[];
+    };
+  };
+}
+
+interface TranslationsRemoveResponse {
+  data: {
+    translationsRemove: {
+      translations: Translation[];
+      userErrors: UserError[];
+    };
+  };
+}
+
 export async function registerTranslations(
   admin: AdminClient,
   {
@@ -16,13 +39,11 @@ export async function registerTranslations(
   const response = await admin.graphql(TRANSLATIONS_REGISTER_MUTATION, {
     variables: { resourceId, translations },
   });
-  const { data } = await response.json();
+  const { data } = (await response.json()) as TranslationsRegisterResponse;
 
   if (data.translationsRegister.userErrors.length > 0) {
     throw new Error(
-      data.translationsRegister.userErrors
-        .map((e: { message: string }) => e.message)
-        .join(", "),
+      data.translationsRegister.userErrors.map((e) => e.message).join(", "),
     );
   }
 
@@ -44,13 +65,11 @@ export async function removeTranslations(
   const response = await admin.graphql(TRANSLATIONS_REMOVE_MUTATION, {
     variables: { resourceId, translationKeys, locales },
   });
-  const { data } = await response.json();
+  const { data } = (await response.json()) as TranslationsRemoveResponse;
 
   if (data.translationsRemove.userErrors.length > 0) {
     throw new Error(
-      data.translationsRemove.userErrors
-        .map((e: { message: string }) => e.message)
-        .join(", "),
+      data.translationsRemove.userErrors.map((e) => e.message).join(", "),
     );
   }
 
