@@ -5,16 +5,22 @@ import { AppProvider } from "@shopify/shopify-app-remix/react";
 import { NavMenu } from "@shopify/app-bridge-react";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 import { authenticate } from "../shopify.server";
+import { countUndismissed } from "../services/alerts.server";
 
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
-  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
+  const { session } = await authenticate.admin(request);
+  const alertCount = await countUndismissed(session.shop);
+  return {
+    apiKey: process.env.SHOPIFY_API_KEY || "",
+    alertCount,
+  };
 };
 
 export default function App() {
-  const { apiKey } = useLoaderData<typeof loader>();
+  const { apiKey, alertCount } = useLoaderData<typeof loader>();
+  const alertsLabel = alertCount > 0 ? `Alerts (${alertCount})` : "Alerts";
 
   return (
     <AppProvider isEmbeddedApp apiKey={apiKey}>
@@ -27,6 +33,8 @@ export default function App() {
         <Link to="/app/auto-translate">Auto-Translate</Link>
         <Link to="/app/images">Images</Link>
         <Link to="/app/glossary">Glossary</Link>
+        <Link to="/app/analytics">Analytics</Link>
+        <Link to="/app/alerts">{alertsLabel}</Link>
         <Link to="/app/settings">Settings</Link>
       </NavMenu>
       <Outlet />

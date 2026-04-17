@@ -37,6 +37,7 @@ import {
 } from "../services/suggestion.server";
 import { upsertContentDigest } from "../services/content-sync.server";
 import { createProvider } from "../services/providers/provider-interface.server";
+import { listAuditLog, writeAuditLog } from "../services/analytics.server";
 import {
   RESOURCE_TYPES,
   getResourceTypeFromSlug,
@@ -150,7 +151,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
   }
 
-  const [suggestions, machineProviders] = await Promise.all([
+  const [suggestions, machineProviders, auditResult] = await Promise.all([
     selectedLocale
       ? listPendingSuggestions(
           session.shop,
@@ -167,6 +168,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       },
       select: { provider: true },
     }),
+    listAuditLog(session.shop, { resourceId, limit: 10 }),
   ]);
 
   return {
@@ -181,6 +183,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     selectedMarketId: marketId,
     suggestions,
     machineProviders: machineProviders.map((p) => p.provider),
+    auditLog: auditResult.rows,
   };
 };
 
@@ -240,6 +243,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       };
       if (suggestion.marketId) input.marketId = suggestion.marketId;
 
+      const previousTranslation =
+        resource?.translations.find((t) => t.key === suggestion.fieldKey)
+          ?.value ?? null;
+
       await registerTranslations(admin, {
         resourceId: suggestion.resourceId,
         translations: [input],
@@ -250,6 +257,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         suggestion.fieldKey,
         hashContent(suggestion.sourceValue),
       );
+      await writeAuditLog({
+        shop: session.shop,
+        resourceId: suggestion.resourceId,
+        resourceType: suggestion.resourceType,
+        locale: suggestion.locale,
+        marketId: suggestion.marketId,
+        fieldKey: suggestion.fieldKey,
+        previousValue: previousTranslation,
+        newValue: finalValue,
+        source: "auto_ai",
+      });
       await acceptSuggestion(session.shop, id, finalValue, edited);
     }
 
@@ -323,6 +341,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
   // Group translations by resourceId (main resource + nested resources)
   const translationsByResource: Record<string, TranslationInput[]> = {};
+  const previousByResourceField: Record<string, Record<string, string | null>> =
+    {};
   for (const [key, value] of formData.entries()) {
     // Format: field_{resourceId}_{fieldKey}
     if (key.startsWith("field_")) {
@@ -333,11 +353,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       const resId = (formData.get(resIdKey) as string) || resourceId!;
 
       if (value && digest) {
-        // Extract field key from the rest (after resourceId prefix if present)
         const fieldKey = (formData.get(`fkey_${rest}`) as string) || rest;
+        const prevValue = formData.has(`prev_${rest}`)
+          ? String(formData.get(`prev_${rest}`) || "")
+          : null;
 
         if (!translationsByResource[resId]) {
           translationsByResource[resId] = [];
+          previousByResourceField[resId] = {};
         }
         const input: TranslationInput = {
           key: fieldKey,
@@ -347,6 +370,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         };
         if (marketId) input.marketId = marketId;
         translationsByResource[resId].push(input);
+        previousByResourceField[resId][fieldKey] = prevValue;
       }
     }
   }
@@ -366,16 +390,42 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return json({ error: "No translations to save. Enter at least one translation value." }, { status: 400 });
   }
 
+  const resourceTypeFromSlug =
+    getResourceTypeFromSlug(params.type!) ?? "UNKNOWN";
+
+  const writeAuditsFor = async (
+    resId: string,
+    resType: string,
+    items: TranslationInput[],
+  ): Promise<void> => {
+    const prevMap = previousByResourceField[resId] ?? {};
+    for (const item of items) {
+      await writeAuditLog({
+        shop: session.shop,
+        resourceId: resId,
+        resourceType: resType,
+        locale,
+        marketId,
+        fieldKey: item.key,
+        previousValue: prevMap[item.key] ?? null,
+        newValue: item.value,
+        source: "manual",
+      });
+    }
+  };
+
   try {
     // Save main resource translations
     if (translations.length > 0) {
       await registerTranslations(admin, { resourceId: resourceId!, translations });
+      await writeAuditsFor(resourceId!, resourceTypeFromSlug, translations);
     }
     // Save nested resource translations
     for (const nId of nestedResourceIds) {
       const nested = translationsByResource[nId];
       if (nested && nested.length > 0) {
         await registerTranslations(admin, { resourceId: nId, translations: nested });
+        await writeAuditsFor(nId, resourceTypeFromSlug, nested);
       }
     }
     return json({ success: true });
@@ -398,6 +448,7 @@ export default function TranslationEditor() {
     selectedMarketId,
     suggestions,
     machineProviders,
+    auditLog,
   } = useLoaderData<typeof loader>();
 
   const fetcher = useFetcher<{
@@ -493,12 +544,14 @@ export default function TranslationEditor() {
         formData.set(`digest_${uid}`, field.digest);
         formData.set(`resId_${uid}`, resourceId);
         formData.set(`fkey_${uid}`, field.key);
+        formData.set(`prev_${uid}`, translationMap[field.key]?.value || "");
       }
     });
 
     // Nested resource fields
     (nestedResources || []).forEach((nr) => {
       const nrValues = nestedValues[nr.resourceId] || {};
+      const nMap = nestedTranslationMaps[nr.resourceId] || {};
       nr.translatableContent.forEach((field) => {
         if (nrValues[field.key]) {
           const uid = `nested_${nr.resourceId}_${field.key}`;
@@ -506,6 +559,7 @@ export default function TranslationEditor() {
           formData.set(`digest_${uid}`, field.digest);
           formData.set(`resId_${uid}`, nr.resourceId);
           formData.set(`fkey_${uid}`, field.key);
+          formData.set(`prev_${uid}`, nMap[field.key]?.value || "");
         }
       });
     });
@@ -799,6 +853,83 @@ export default function TranslationEditor() {
                   </Box>
                 );
               })}
+            </BlockStack>
+          </Card>
+        )}
+
+        {auditLog && auditLog.length > 0 && (
+          <Card>
+            <BlockStack gap="300">
+              <Text as="h2" variant="headingMd">
+                History ({auditLog.length})
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Most recent translation changes on this resource.
+              </Text>
+              <Box>
+                <table
+                  style={{ width: "100%", borderCollapse: "collapse" }}
+                >
+                  <thead>
+                    <tr style={{ textAlign: "left" }}>
+                      <th style={{ padding: 8 }}>Field</th>
+                      <th style={{ padding: 8 }}>Source</th>
+                      <th style={{ padding: 8 }}>Previous</th>
+                      <th style={{ padding: 8 }}>New</th>
+                      <th style={{ padding: 8 }}>When</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {auditLog.map((row) => (
+                      <tr
+                        key={row.id}
+                        style={{
+                          borderTop:
+                            "1px solid var(--p-color-border)",
+                        }}
+                      >
+                        <td style={{ padding: 8 }}>
+                          {fieldDisplayLabel(row.fieldKey)}
+                        </td>
+                        <td style={{ padding: 8 }}>
+                          <Badge>{row.source}</Badge>
+                        </td>
+                        <td style={{ padding: 8 }}>
+                          <Text
+                            as="span"
+                            variant="bodySm"
+                            tone="subdued"
+                            breakWord
+                          >
+                            {row.previousValue
+                              ? row.previousValue.length > 120
+                                ? row.previousValue.substring(0, 120) +
+                                  "..."
+                                : row.previousValue
+                              : "—"}
+                          </Text>
+                        </td>
+                        <td style={{ padding: 8 }}>
+                          <Text as="span" variant="bodySm" breakWord>
+                            {row.newValue.length > 120
+                              ? row.newValue.substring(0, 120) + "..."
+                              : row.newValue}
+                          </Text>
+                        </td>
+                        <td style={{ padding: 8 }}>
+                          <Text
+                            as="span"
+                            variant="bodySm"
+                            tone="subdued"
+                          >
+                            {new Date(row.createdAt).toLocaleString()}
+                          </Text>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Box>
             </BlockStack>
           </Card>
         )}

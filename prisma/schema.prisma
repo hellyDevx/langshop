@@ -46,13 +46,14 @@ model TranslationJob {
   completedItems  Int       @default(0)
   failedItems     Int       @default(0)
   errorMessage    String?
-  retryCount      Int       @default(0)
-  scheduledAt     DateTime?
-  startedAt       DateTime?
-  completedAt     DateTime?
-  glossaryApplied Boolean   @default(false)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  retryCount       Int       @default(0)
+  scheduledAt      DateTime?
+  startedAt        DateTime?
+  completedAt      DateTime?
+  glossaryApplied  Boolean   @default(false)
+  resourceIdFilter String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
   entries TranslationJobEntry[]
 

@@ -21,6 +21,8 @@ import {
 import { getBrandVoiceConfig, buildAISystemPrompt } from "./brand-voice.server";
 import { upsertSuggestion } from "./suggestion.server";
 import { recordProviderUsage } from "./usage.server";
+import { createAlert } from "./alerts.server";
+import { writeAuditLog, type AuditSource } from "./analytics.server";
 import { hashContent } from "../utils/content-hash";
 import type { ProductContext } from "../utils/graphql-batcher";
 import { TRANSLATABLE_RESOURCES_QUERY } from "../graphql/queries/translatableResources";
@@ -59,6 +61,12 @@ interface FreshResource {
     value: string;
     digest: string;
     locale: string;
+  }>;
+  translations?: Array<{
+    key: string;
+    value: string;
+    locale: string;
+    outdated?: boolean;
   }>;
   productContext?: ProductContext;
 }
@@ -195,19 +203,16 @@ export async function scheduleRetry(
         completedAt: new Date(),
       },
     });
-    await prisma.translationAlert.create({
-      data: {
-        shop: (
-          await prisma.translationJob.findUniqueOrThrow({
-            where: { id: jobId },
-            select: { shop: true },
-          })
-        ).shop,
-        type: "failure",
-        severity: "critical",
-        message: `Translation job failed after ${attemptCount} attempts: ${errorMessage}`,
-        jobId,
-      },
+    const { shop } = await prisma.translationJob.findUniqueOrThrow({
+      where: { id: jobId },
+      select: { shop: true },
+    });
+    await createAlert({
+      shop,
+      type: "failure",
+      severity: "critical",
+      message: `Translation job failed after ${attemptCount} attempts: ${errorMessage}`,
+      jobId,
     });
     return;
   }
@@ -263,104 +268,132 @@ export async function runTranslationJob(
     });
   }
 
-  let cursor: string | null = null;
+  const filterIds = job.resourceIdFilter
+    ? (JSON.parse(job.resourceIdFilter) as string[])
+    : null;
+
   let totalProcessed = 0;
   let totalFailed = 0;
 
-  try {
-    while (true) {
-      const gqlResponse = await admin.graphql(TRANSLATABLE_RESOURCES_QUERY, {
-        variables: {
-          resourceType: job.resourceType,
-          first: 10,
-          after: cursor,
+  const processResourceBatch = async (
+    resourceIds: string[],
+    hasMoreHint: number,
+  ): Promise<void> => {
+    const batchedResources = await batchFetchTranslatableResources(
+      admin,
+      resourceIds,
+      job.targetLocale,
+      { includeProductContext: useAi && job.resourceType === "PRODUCT" },
+    );
+
+    for (const resourceId of resourceIds) {
+      try {
+        const freshResource = batchedResources[resourceId];
+        if (!freshResource) throw new Error("Resource not found in batch");
+
+        const resourceStats = useAi
+          ? await translateResourceAi(
+              provider as AiTranslationProvider,
+              freshResource,
+              job.shop,
+              job.sourceLocale,
+              job.targetLocale,
+              job.marketId,
+              job.resourceType,
+              job.provider,
+              aiSystemPrompt ?? "",
+              glossaryRules,
+            )
+          : await translateResourceFromData(
+              admin,
+              provider,
+              freshResource,
+              job.shop,
+              job.sourceLocale,
+              job.targetLocale,
+              job.marketId,
+              jobId,
+              glossaryRules,
+              job.provider,
+              job.resourceType,
+            );
+        if (resourceStats.glossaryMatched) glossaryApplied = true;
+        totalProcessed++;
+      } catch (error) {
+        if (error instanceof ProviderTransientError) {
+          throw error;
+        }
+        totalFailed++;
+        const message =
+          error instanceof Error ? error.message : String(error);
+        console.error(`Failed to translate ${resourceId}:`, message);
+      }
+
+      await prisma.translationJob.update({
+        where: { id: jobId },
+        data: {
+          completedItems: totalProcessed,
+          failedItems: totalFailed,
+          totalItems: totalProcessed + totalFailed + hasMoreHint,
         },
       });
-      const gqlJson = (await gqlResponse.json()) as TranslatableResourcesResponse;
-      const { nodes, pageInfo } = gqlJson.data.translatableResources;
+    }
+  };
 
-      if (nodes.length === 0) break;
+  try {
+    if (filterIds) {
+      await prisma.translationJob.update({
+        where: { id: jobId },
+        data: { totalItems: filterIds.length },
+      });
 
-      if (!cursor) {
-        await prisma.translationJob.update({
-          where: { id: jobId },
-          data: {
-            totalItems: nodes.length + (pageInfo.hasNextPage ? 10 : 0),
+      const chunkSize = 10;
+      for (let i = 0; i < filterIds.length; i += chunkSize) {
+        const chunk = filterIds.slice(i, i + chunkSize);
+        const remaining = Math.max(
+          0,
+          filterIds.length - totalProcessed - totalFailed - chunk.length,
+        );
+        await processResourceBatch(chunk, remaining);
+        if (i + chunkSize < filterIds.length) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+    } else {
+      let cursor: string | null = null;
+      while (true) {
+        const gqlResponse = await admin.graphql(TRANSLATABLE_RESOURCES_QUERY, {
+          variables: {
+            resourceType: job.resourceType,
+            first: 10,
+            after: cursor,
           },
         });
-      }
+        const gqlJson = (await gqlResponse.json()) as TranslatableResourcesResponse;
+        const { nodes, pageInfo } = gqlJson.data.translatableResources;
 
-      const resourceIds = nodes.map((n) => n.resourceId);
-      const batchedResources = await batchFetchTranslatableResources(
-        admin,
-        resourceIds,
-        job.targetLocale,
-        { includeProductContext: useAi && job.resourceType === "PRODUCT" },
-      );
+        if (nodes.length === 0) break;
 
-      for (const resource of nodes) {
-        try {
-          const freshResource = batchedResources[resource.resourceId];
-          if (!freshResource) throw new Error("Resource not found in batch");
-
-          const resourceStats = useAi
-            ? await translateResourceAi(
-                provider as AiTranslationProvider,
-                freshResource,
-                job.shop,
-                job.sourceLocale,
-                job.targetLocale,
-                job.marketId,
-                job.resourceType,
-                job.provider,
-                aiSystemPrompt ?? "",
-                glossaryRules,
-              )
-            : await translateResourceFromData(
-                admin,
-                provider,
-                freshResource,
-                job.shop,
-                job.sourceLocale,
-                job.targetLocale,
-                job.marketId,
-                jobId,
-                glossaryRules,
-                job.provider,
-              );
-          if (resourceStats.glossaryMatched) glossaryApplied = true;
-          totalProcessed++;
-        } catch (error) {
-          if (error instanceof ProviderTransientError) {
-            // Roll back progress and retry the whole job later.
-            throw error;
-          }
-          totalFailed++;
-          const message =
-            error instanceof Error ? error.message : String(error);
-          console.error(
-            `Failed to translate ${resource.resourceId}:`,
-            message,
-          );
+        if (!cursor) {
+          await prisma.translationJob.update({
+            where: { id: jobId },
+            data: {
+              totalItems: nodes.length + (pageInfo.hasNextPage ? 10 : 0),
+            },
+          });
         }
 
-        await prisma.translationJob.update({
-          where: { id: jobId },
-          data: {
-            completedItems: totalProcessed,
-            failedItems: totalFailed,
-            totalItems:
-              totalProcessed + totalFailed + (pageInfo.hasNextPage ? 10 : 0),
-          },
-        });
-      }
+        await processResourceBatch(
+          nodes.map((n) => n.resourceId),
+          pageInfo.hasNextPage ? 10 : 0,
+        );
 
-      if (pageInfo.hasNextPage) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (pageInfo.hasNextPage) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (!pageInfo.hasNextPage) break;
+        cursor = pageInfo.endCursor ?? null;
       }
-
-      if (!pageInfo.hasNextPage) break;
-      cursor = pageInfo.endCursor ?? null;
     }
 
     await prisma.translationJob.update({
@@ -393,14 +426,12 @@ export async function runTranslationJob(
         completedAt: new Date(),
       },
     });
-    await prisma.translationAlert.create({
-      data: {
-        shop: job.shop,
-        type: "failure",
-        severity: "critical",
-        message: `Translation job failed: ${message}`,
-        jobId,
-      },
+    await createAlert({
+      shop: job.shop,
+      type: "failure",
+      severity: "critical",
+      message: `Translation job failed: ${message}`,
+      jobId,
     });
     throw error;
   }
@@ -409,6 +440,13 @@ export async function runTranslationJob(
 interface ResourceTranslationStats {
   glossaryMatched: boolean;
 }
+
+const AUDIT_SOURCE_BY_PROVIDER: Record<string, AuditSource> = {
+  google: "auto_google",
+  deepl: "auto_deepl",
+  claude: "auto_claude",
+  openai: "auto_openai",
+};
 
 async function translateResourceFromData(
   admin: AdminClient,
@@ -421,6 +459,7 @@ async function translateResourceFromData(
   jobId: string,
   glossaryRules: GlossaryTerm[],
   jobProvider: string,
+  resourceType: string,
 ): Promise<ResourceTranslationStats> {
   const translatableFields = freshResource.translatableContent.filter(
     (c) => c.value && c.value.trim() !== "",
@@ -512,6 +551,28 @@ async function translateResourceFromData(
       field.key,
       hashContent(field.value),
     );
+  }
+
+  const prevByKey = new Map<string, string>();
+  for (const t of freshResource.translations ?? []) {
+    prevByKey.set(t.key, t.value);
+  }
+  const auditSource = AUDIT_SOURCE_BY_PROVIDER[jobProvider];
+  if (auditSource) {
+    for (let i = 0; i < translatableFields.length; i++) {
+      const field = translatableFields[i];
+      await writeAuditLog({
+        shop,
+        resourceId: freshResource.resourceId,
+        resourceType,
+        locale: targetLocale,
+        marketId,
+        fieldKey: field.key,
+        previousValue: prevByKey.get(field.key) ?? null,
+        newValue: translatedTexts[i],
+        source: auditSource,
+      });
+    }
   }
 
   return { glossaryMatched };
